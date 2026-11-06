@@ -92,8 +92,28 @@ UPDATE_PING_ROLE = "Update Ping"
 
 # Live player counter (channel at the top of the server, renamed every 10 min)
 PLAYER_COUNT_PREFIX = "🎮 Playing now"
-# Tickets with no new message for this long are closed automatically
-TICKET_AUTOCLOSE_HOURS = 48
+# Tickets: when staff replied and the player is silent this long, the bot pings them with a countdown;
+# if they still don't answer, the ticket closes. Any reply from the player resets the timer.
+TICKET_REMIND_AFTER_HOURS = 24
+TICKET_CLOSE_AFTER_HOURS = 24       # counted from the reminder
+
+# ---- Own AutoMod (staff are exempt) ----
+# Words are checked after cleaning tricks like "f.u.c.k", "fuuuck", "sh1t", "b!tch".
+BAD_CONTAINS = ("fuck", "cunt", "nigg", "fagg", "whore", "bitch", "motherf")   # anywhere in a word
+BAD_PREFIX = ("shit", "slut", "retard", "porn", "bastard", "asshole", "dickhead", "wank", "twat",
+              "penis", "vagina", "rapist", "dumbass", "jackass")                  # start of a word
+BAD_EXACT = {"ass", "dick", "cock", "pussy", "fag", "sex", "nude", "nudes", "rape", "raped", "kys",
+             "stfu", "cum", "boobs", "tits", "nigga", "damn", "wtf"}  # not "hoe" - a farming tool!  # whole word only
+BAD_PHRASES = ("kill yourself", "kill urself", "kill your self", "go die")
+SPAM_MESSAGES, SPAM_SECONDS = 5, 6        # 5 messages in 6 s = spam
+SPAM_REPEATS = 3                          # the same message 3x in 20 s = spam
+WARN_WINDOW_DAYS = 30                     # warnings older than this don't count toward punishments
+WARN_PUNISHMENTS = {                      # active warnings -> timeout length
+    2: datetime.timedelta(minutes=10),
+    3: datetime.timedelta(hours=1),
+    4: datetime.timedelta(days=1),
+    5: datetime.timedelta(days=7),        # 5+ warnings: 7 days and a staff alert
+}
 GIVEAWAY_PING_ROLE = "Giveaway Ping"
 SUGGESTION_REACTIONS = ["👍", "👎"]
 FIXED_TAG = "Fixed"
@@ -112,6 +132,8 @@ db.execute("CREATE TABLE IF NOT EXISTS xp (user_id INTEGER PRIMARY KEY, xp INTEG
 db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS giveaways (message_id INTEGER PRIMARY KEY, channel_id INTEGER,"
            " prize TEXT, winners INTEGER, end_ts INTEGER, host_id INTEGER, ended INTEGER DEFAULT 0)")
+db.execute("CREATE TABLE IF NOT EXISTS warns (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,"
+           " mod_id INTEGER, reason TEXT, ts INTEGER)")
 db.execute("CREATE TABLE IF NOT EXISTS gw_entries (message_id INTEGER, user_id INTEGER,"
            " PRIMARY KEY (message_id, user_id))")
 db.commit()
@@ -254,7 +276,9 @@ async def open_ticket(interaction: discord.Interaction, reason: str):
         title=f"🎫 Ticket #{number:04d} - {reason}",
         description="Thanks for reaching out! Describe your problem here and staff will reply soon.\n\n"
                     "**Please include:** your Roblox username, what happened, and screenshots if you can "
-                    "(for purchases: a screenshot of the transaction).",
+                    "(for purchases: a screenshot of the transaction).\n\n"
+                    f"⏰ If staff replies and you don't answer for {TICKET_REMIND_AFTER_HOURS} h, you'll get a "
+                    f"reminder, and the ticket closes {TICKET_CLOSE_AFTER_HOURS} h after that.",
         colour=SAND)
     await ch.send(content=f"{user.mention} {ping.mention if ping else ''}", embed=embed,
                   view=CloseTicketView(),
@@ -323,12 +347,18 @@ CONTROL_HELP = [
      "`/update` - okienko z patch notes; post idzie do #updates z pingiem Update Ping.\n"
      "`/giveaway nagroda czas [zwycięzcy]` - giveaway w #giveaways, czas np. `30m`, `2h`, `1d12h`.\n"
      "`/giveaway-end id_wiadomości` - kończy giveaway od razu, a po zakończeniu losuje nowego zwycięzcę."),
+    ("🛡️ Moderacja (Moderator i wyżej)",
+     "`/warn gracz powód` - ostrzeżenie (gracz dostaje DM)\n"
+     "`/warnings gracz` - lista ostrzeżeń, `/delwarn numer` - usuwa jedno, `/clearwarns gracz` - wszystkie (admin)\n"
+     "`/mute gracz czas [powód]` - wyciszenie np. `10m`, `2h`, `1d`; `/unmute gracz`\n"
+     "Kary za aktywne ostrzeżenia (z 30 dni): 2 = 10 min, 3 = 1 h, 4 = 1 dzień, 5+ = 7 dni i ping Moderatorów."),
     ("🌴 Komendy dla graczy",
      "`/rank` - poziom i XP, `/leaderboard` - top 10 najaktywniejszych."),
     ("⚙️ Działa samo",
      "• Licznik graczy na górze serwera (co 10 min)\n"
      "• Post w #updates, gdy opublikujesz nową wersję gry (max 1 na 6 h, `/update` go zastępuje)\n"
-     "• Tickety bez aktywności przez 48 h zamykają się same, zapis rozmowy idzie do #mod-log\n"
+     "• Ticket: gdy staff odpisze, a gracz milczy 24 h - ping z licznikiem; po kolejnych 24 h ticket się zamyka\n"
+     "• Własny AutoMod: przekleństwa po angielsku (też f.u.c.k, sh1t itp.) i spam = usunięcie + ostrzeżenie\n"
      "• 👍/👎 pod każdą propozycją, autor buga dostaje info po tagu **Fixed**\n"
      "• #mutation-showcase przyjmuje tylko obrazki\n"
      "• XP i role za poziomy, Join to Create, logi, AutoMod Discorda"),
@@ -442,6 +472,168 @@ async def on_ready():
     print(f"OASIS bot online as {bot.user} in {guild.name}")
 
 
+# ---- Own AutoMod: bad words, spam, warnings, timeouts ----
+LEET = str.maketrans({"0": "o", "1": "i", "!": "i", "|": "i", "3": "e", "4": "a", "@": "a",
+                      "5": "s", "$": "s", "7": "t", "+": "t", "8": "b", "9": "g"})
+
+
+def bad_word_in(text):
+    t = text.lower().translate(LEET)
+    t = re.sub(r"(?<=\b\w)[\s.\-_*]+(?=\w\b)", "", t)        # "f u c k" / "f.u.c.k" -> "fuck"
+    joined = " ".join(re.findall(r"[a-z]+", t))
+    if any(re.search(rf"\b{re.escape(p)}\b", joined) for p in BAD_PHRASES):
+        return True
+    for word in joined.split():
+        for w in {word, re.sub(r"(.)\1+", r"\1", word)}:     # also check "fuuuck" -> "fuck"
+            if w in BAD_EXACT or w.startswith(BAD_PREFIX) or any(b in w for b in BAD_CONTAINS):
+                return True
+    return False
+
+
+def active_warns(user_id):
+    since = int(time.time()) - WARN_WINDOW_DAYS * 86400
+    return db.execute("SELECT COUNT(*) FROM warns WHERE user_id=? AND ts>=?", (user_id, since)).fetchone()[0]
+
+
+def fmt_delta(d):
+    s = int(d.total_seconds())
+    return f"{s // 86400} d" if s >= 86400 else f"{s // 3600} h" if s >= 3600 else f"{s // 60} min"
+
+
+async def add_warn(member, reason, moderator=None):
+    db.execute("INSERT INTO warns(user_id, mod_id, reason, ts) VALUES(?,?,?,?)",
+               (member.id, moderator.id if moderator else 0, reason, int(time.time())))
+    db.commit()
+    count = active_warns(member.id)
+    punish = WARN_PUNISHMENTS.get(min(count, max(WARN_PUNISHMENTS))) if count >= min(WARN_PUNISHMENTS) else None
+    result = f"warning **{count}**"
+    if punish:
+        try:
+            await member.timeout(punish, reason=f"{count} warnings: {reason}")
+            result += f" → muted for **{fmt_delta(punish)}**"
+        except discord.HTTPException:
+            result += " (couldn't mute - their role is above the bot)"
+    try:
+        await member.send(f"⚠️ You got a warning on the OASIS server: **{reason}**\n"
+                          f"Active warnings: {count}."
+                          + (f" You are muted for {fmt_delta(punish)}." if punish else "")
+                          + " Please follow the rules 🌴")
+    except discord.HTTPException:
+        pass                                     # DMs closed
+    by = moderator.mention if moderator else "AutoMod"
+    alert = " 🚨 <@&{}>".format(role(member.guild, "Moderator").id) \
+        if count >= max(WARN_PUNISHMENTS) and role(member.guild, "Moderator") else ""
+    ch = channel(member.guild, "modlog")
+    if ch:
+        await ch.send(f"⚠️ {member.mention} {result} by {by} - {reason}{alert}",
+                      allowed_mentions=discord.AllowedMentions(roles=True, users=False))
+    return count, punish
+
+
+spam_tracker = {}       # user_id -> [(time, content), ...]
+last_auto_warn = {}     # user_id -> time, so one burst of spam gives one warning
+automod_deleted = set()  # ids removed by AutoMod (already logged as a warning)
+
+
+async def automod_check(message):
+    """Returns True if the message was removed."""
+    member = message.author
+    if is_staff(member):
+        return False
+    reason = None
+    if message.content and bad_word_in(message.content):
+        reason = "Bad language"
+    else:
+        now = time.time()
+        history = [(t, c) for t, c in spam_tracker.get(member.id, []) if now - t < 20] + \
+                  [(now, message.content.lower().strip())]
+        spam_tracker[member.id] = history
+        burst = sum(1 for t, _ in history if now - t < SPAM_SECONDS) >= SPAM_MESSAGES
+        repeats = message.content and sum(1 for _, c in history if c == history[-1][1]) >= SPAM_REPEATS
+        if burst or repeats:
+            reason = "Spam"
+    if reason is None:
+        return False
+    automod_deleted.add(message.id)
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+    now = time.time()
+    if now - last_auto_warn.get(member.id, 0) > 30:
+        last_auto_warn[member.id] = now
+        count, punish = await add_warn(member, f"{reason} (auto)")
+        await message.channel.send(
+            f"⚠️ {member.mention} {'watch your language' if reason == 'Bad language' else 'slow down'}! "
+            f"Warning {count}" + (f" - muted for {fmt_delta(punish)}." if punish else "."), delete_after=10)
+    return True
+
+
+@bot.tree.command(name="warn", description="Give a member a warning")
+@app_commands.default_permissions(moderate_members=True)
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
+    count, punish = await add_warn(member, reason, interaction.user)
+    await interaction.response.send_message(
+        f"⚠️ Warned {member.mention} ({count} active)" + (f", muted for {fmt_delta(punish)}." if punish else "."),
+        ephemeral=True)
+
+
+@bot.tree.command(name="warnings", description="Show a member's warnings")
+@app_commands.default_permissions(moderate_members=True)
+async def warnings(interaction: discord.Interaction, member: discord.Member):
+    rows = db.execute("SELECT id, mod_id, reason, ts FROM warns WHERE user_id=? ORDER BY ts DESC LIMIT 15",
+                      (member.id,)).fetchall()
+    text = "\n".join(f"`#{i}` <t:{ts}:d> - {r} (by {'AutoMod' if not m else f'<@{m}>'})"
+                     for i, m, r, ts in rows) or "No warnings 🌴"
+    await interaction.response.send_message(
+        embed=discord.Embed(title=f"Warnings: {member.display_name} ({active_warns(member.id)} active)",
+                            description=text, colour=SAND), ephemeral=True)
+
+
+@bot.tree.command(name="delwarn", description="Remove one warning by its number")
+@app_commands.default_permissions(moderate_members=True)
+async def delwarn(interaction: discord.Interaction, warning_id: int):
+    gone = db.execute("DELETE FROM warns WHERE id=?", (warning_id,)).rowcount
+    db.commit()
+    await interaction.response.send_message("Removed." if gone else "No warning with that number.",
+                                            ephemeral=True)
+
+
+@bot.tree.command(name="clearwarns", description="Remove all warnings of a member")
+@app_commands.default_permissions(administrator=True)
+async def clearwarns(interaction: discord.Interaction, member: discord.Member):
+    db.execute("DELETE FROM warns WHERE user_id=?", (member.id,))
+    db.commit()
+    await interaction.response.send_message(f"Cleared all warnings of {member.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="mute", description="Mute (timeout) a member")
+@app_commands.describe(duration="e.g. 10m, 2h, 1d (max 28d)")
+@app_commands.default_permissions(moderate_members=True)
+async def mute(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = "No reason"):
+    seconds = min(parse_duration(duration), 28 * 86400)
+    if seconds < 60:
+        return await interaction.response.send_message("Duration e.g. 10m, 2h, 1d.", ephemeral=True)
+    try:
+        await member.timeout(datetime.timedelta(seconds=seconds), reason=reason)
+    except discord.HTTPException:
+        return await interaction.response.send_message("Can't mute this member (role above the bot?).",
+                                                       ephemeral=True)
+    await log(interaction.guild, discord.Embed(
+        description=f"🔇 {member.mention} muted for {fmt_delta(datetime.timedelta(seconds=seconds))} "
+                    f"by {interaction.user.mention} - {reason}", colour=RED))
+    await interaction.response.send_message(f"🔇 Muted {member.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="unmute", description="Remove a member's mute")
+@app_commands.default_permissions(moderate_members=True)
+async def unmute(interaction: discord.Interaction, member: discord.Member):
+    await member.timeout(None)
+    await log(interaction.guild, discord.Embed(
+        description=f"🔊 {member.mention} unmuted by {interaction.user.mention}", colour=GREEN))
+    await interaction.response.send_message(f"🔊 Unmuted {member.mention}.", ephemeral=True)
+
+
 # ---- logs ----
 @bot.event
 async def on_member_join(member):
@@ -463,6 +655,9 @@ async def on_message_delete(message):
         return
     if message.channel.name == CH["showcase"] and not message.attachments:
         return    # removed by the picture-only filter, not worth logging
+    if message.id in automod_deleted:
+        automod_deleted.discard(message.id)
+        return
     await log(message.guild, discord.Embed(
         description=f"🗑️ Message by {message.author.mention} deleted in {message.channel.mention}\n"
                     f">>> {message.content[:1000] or '*(no text)*'}", colour=RED))
@@ -476,12 +671,21 @@ async def on_message_edit(before, after):
         description=f"✏️ {after.author.mention} edited a message in {after.channel.mention} "
                     f"([jump]({after.jump_url}))\n**Before:** {before.content[:900]}\n"
                     f"**After:** {after.content[:900]}", colour=SAND))
+    if not is_staff(after.author) and bad_word_in(after.content):     # edited into a bad word
+        automod_deleted.add(after.id)
+        try:
+            await after.delete()
+        except discord.HTTPException:
+            pass
+        await add_warn(after.author, "Bad language (auto, edited message)")
 
 
 # ---- XP ----
 @bot.event
 async def on_message(message):
     if not our_guild(message.guild) or message.author.bot or message.channel.name.startswith("ticket-"):
+        return
+    if await automod_check(message):
         return
     # mutation-showcase is a gallery: messages without a picture/video are removed
     if message.channel.name == CH["showcase"] and not message.attachments and not is_staff(message.author):
@@ -698,21 +902,42 @@ async def on_thread_update(before, after):
                          f"thanks for reporting it! 🌴")
 
 
-# ---- Tickets: auto-close inactive ones ----
-@tasks.loop(hours=1)
+# ---- Tickets: remind silent players, then close ----
+@tasks.loop(minutes=10)
 async def autoclose_tickets():
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
         return
-    limit = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=TICKET_AUTOCLOSE_HOURS)
+    now = time.time()
     for ch in list(guild.text_channels):
-        if ticket_owner_id(ch) is None:
+        owner = ticket_owner_id(ch)
+        if owner is None:
             continue
-        last = discord.utils.snowflake_time(ch.last_message_id) if ch.last_message_id else ch.created_at
-        if last < limit:
-            await ch.send(f"⏰ No activity for {TICKET_AUTOCLOSE_HOURS} h - closing this ticket. "
-                          f"Open a new one anytime!")
-            await close_ticket(ch, f"auto-closed after {TICKET_AUTOCLOSE_HOURS} h without activity")
+        last_human = None
+        async for m in ch.history(limit=50):
+            if not m.author.bot:
+                last_human = m
+                break
+        if last_human is not None and last_human.author.id == owner:
+            kv_set(f"ticket_rem:{ch.id}", "")          # player answered - waiting on staff, no timer
+            continue
+        # waiting on the player: since staff's last message, or since the ticket opened
+        since = (last_human.created_at if last_human else ch.created_at).timestamp()
+        state = json.loads(kv_get(f"ticket_rem:{ch.id}") or "{}")
+        if state.get("since") != since:                # new staff message -> fresh countdown
+            state = {"since": since}
+        if "close" not in state:
+            if now - since >= TICKET_REMIND_AFTER_HOURS * 3600:
+                state["close"] = int(now + TICKET_CLOSE_AFTER_HOURS * 3600)
+                await ch.send(f"⏰ <@{owner}> we're waiting for your reply! If you don't answer, this "
+                              f"ticket closes automatically <t:{state['close']}:R>.",
+                              allowed_mentions=discord.AllowedMentions(users=True))
+        elif now >= state["close"]:
+            kv_set(f"ticket_rem:{ch.id}", "")
+            await ch.send("🔒 No reply - closing this ticket. Open a new one anytime!")
+            await close_ticket(ch, "auto-closed (no reply from the player)")
+            continue
+        kv_set(f"ticket_rem:{ch.id}", json.dumps(state))
 
 
 # ---- Giveaways ----
