@@ -346,7 +346,9 @@ CONTROL_HELP = [
     ("📢 Komendy staffu (działają na każdym kanale)",
      "`/update` - okienko z patch notes; post idzie do #updates z pingiem Update Ping.\n"
      "`/giveaway nagroda czas [zwycięzcy]` - giveaway w #giveaways, czas np. `30m`, `2h`, `1d12h`.\n"
-     "`/giveaway-end id_wiadomości` - kończy giveaway od razu, a po zakończeniu losuje nowego zwycięzcę."),
+     "`/giveaway-end id_wiadomości` - kończy giveaway od razu, a po zakończeniu losuje nowego zwycięzcę.\n"
+     "`/clear okres [gracz]` - czyści kanał, w którym to wpiszesz: `30m`, `2h`, `1d`, `7d` albo `all` "
+     "(cały kanał, z potwierdzeniem). Przypięte wiadomości i panele zostają."),
     ("🛡️ Moderacja (Moderator i wyżej)",
      "`/warn gracz powód` - ostrzeżenie (gracz dostaje DM)\n"
      "`/warnings gracz` - lista ostrzeżeń, `/delwarn numer` - usuwa jedno, `/clearwarns gracz` - wszystkie (admin)\n"
@@ -361,7 +363,8 @@ CONTROL_HELP = [
      "• Własny AutoMod: przekleństwa po angielsku (też f.u.c.k, sh1t itp.) i spam = usunięcie + ostrzeżenie\n"
      "• 👍/👎 pod każdą propozycją, autor buga dostaje info po tagu **Fixed**\n"
      "• #mutation-showcase przyjmuje tylko obrazki\n"
-     "• XP i role za poziomy, Join to Create, logi, AutoMod Discorda"),
+     "• XP i role za poziomy, Join to Create, AutoMod Discorda\n"
+     "• #mod-log: tylko usunięte/edytowane wiadomości, ostrzeżenia, wyciszenia, /clear i tickety"),
 ]
 
 
@@ -635,12 +638,72 @@ async def unmute(interaction: discord.Interaction, member: discord.Member):
 
 
 # ---- logs ----
-@bot.event
-async def on_member_join(member):
-    if our_guild(member.guild):
-        await log(member.guild, discord.Embed(
-            description=f"📥 {member.mention} joined (account created "
-                        f"{discord.utils.format_dt(member.created_at, 'R')})", colour=GREEN))
+# ---- /clear ----
+FULL_CLEAR_WORDS = {"all", "full", "everything", "wszystko"}
+clearing_channels = set()   # no delete-logs while /clear runs
+
+
+def panel_message_ids():
+    return {int(v) for k in ("verify", "roles", "ticket", "control")
+            if (v := kv_get(f"panel:{k}")) and v.isdigit()}
+
+
+class ConfirmFullClear(discord.ui.View):
+    def __init__(self, target):
+        super().__init__(timeout=60)
+        self.target = target
+
+    @discord.ui.button(label="Yes, wipe the whole channel", style=discord.ButtonStyle.danger, emoji="🧹")
+    async def confirm(self, interaction: discord.Interaction, _):
+        await interaction.response.edit_message(content="🧹 Wiping...", view=None)
+        old = self.target
+        new = await old.clone(reason=f"/clear all by {interaction.user}")   # same name, settings, permissions
+        await new.edit(position=old.position)
+        await old.delete(reason=f"/clear all by {interaction.user}")
+        await post_panels(interaction.guild)          # re-post panels if this channel had one
+        await ensure_control_channel(interaction.guild)
+        await new.send("🧹 Channel cleared.", delete_after=10)
+        await log(interaction.guild, discord.Embed(
+            description=f"🧹 {interaction.user.mention} fully cleared #{new.name}", colour=SAND))
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+@bot.tree.command(name="clear", description="Delete messages in this channel")
+@app_commands.describe(period="How far back: e.g. 30m, 2h, 1d, 7d - or 'all' for the whole channel",
+                       member="Only delete this member's messages (optional)")
+@app_commands.default_permissions(manage_messages=True)
+async def clear(interaction: discord.Interaction, period: str, member: discord.Member | None = None):
+    ch = interaction.channel
+    if period.lower().strip() in FULL_CLEAR_WORDS:
+        if member is not None:
+            return await interaction.response.send_message(
+                "'all' wipes the whole channel - to remove one member's messages use a time, e.g. 30d.",
+                ephemeral=True)
+        return await interaction.response.send_message(
+            f"⚠️ Delete **every message** in {ch.mention}? This can't be undone "
+            f"(the channel is recreated with the same settings; panels are re-posted).",
+            view=ConfirmFullClear(ch), ephemeral=True)
+    seconds = parse_duration(period)
+    if seconds < 60:
+        return await interaction.response.send_message(
+            "Give a time like `30m`, `2h`, `1d`, `7d` - or `all`.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    after = discord.utils.utcnow() - datetime.timedelta(seconds=seconds)
+    keep = panel_message_ids()
+    clearing_channels.add(ch.id)
+    try:
+        deleted = await ch.purge(limit=None, after=after, check=lambda m: not m.pinned and m.id not in keep
+                                 and (member is None or m.author.id == member.id))
+    finally:
+        clearing_channels.discard(ch.id)
+    await interaction.followup.send(f"🧹 Deleted **{len(deleted)}** messages from the last {period}"
+                                    + (f" by {member.mention}" if member else "") + ".")
+    await log(interaction.guild, discord.Embed(
+        description=f"🧹 {interaction.user.mention} cleared {len(deleted)} messages in {ch.mention} "
+                    f"(last {period}{f', only {member.mention}' if member else ''})", colour=SAND))
 
 
 @bot.event
@@ -649,6 +712,8 @@ async def on_message_delete(message):
         return
     if message.channel.name == CH["showcase"] and not message.attachments:
         return    # removed by the picture-only filter, not worth logging
+    if message.channel.id in clearing_channels:
+        return
     if message.id in automod_deleted:
         automod_deleted.discard(message.id)
         return
