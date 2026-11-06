@@ -644,12 +644,6 @@ async def on_member_join(member):
 
 
 @bot.event
-async def on_member_remove(member):
-    if our_guild(member.guild):
-        await log(member.guild, discord.Embed(description=f"📤 **{member}** left", colour=RED))
-
-
-@bot.event
 async def on_message_delete(message):
     if not our_guild(message.guild) or message.author.bot or message.channel.name.startswith("ticket-"):
         return
