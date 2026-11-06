@@ -62,7 +62,10 @@ CH = {
     "suggestions": "💡・suggestions",
     "bugs":    "🐛・bug-reports",
     "giveaways": "🎉・giveaways",
+    "control": "🤖・bot-control",
 }
+CONTROL_CATEGORY = "🛠️ STAFF"
+CONTROL_ROLE = "Owner"          # only this role (and the bot) can see the control channel
 SUPPORT_CATEGORY = "🎫 SUPPORT"
 
 STAFF = ["Owner", "Developer", "Admin", "Moderator"]
@@ -312,6 +315,56 @@ async def ensure_panel(guild, key, embed, view):
     print(f"+ posted panel in {ch.name}")
 
 
+CONTROL_HELP = [
+    ("🔧 Komendy tylko dla ciebie (wpisuj tutaj)",
+     "`/botupdate` - pobiera nowy kod bota z GitHuba i restartuje bota. Po restarcie kanał sam się czyści.\n"
+     "`/panels` - wystawia od nowa panele weryfikacji, ról i ticketów (gdy ktoś je usunie)."),
+    ("📢 Komendy staffu (działają na każdym kanale)",
+     "`/update` - okienko z patch notes; post idzie do #updates z pingiem Update Ping.\n"
+     "`/giveaway nagroda czas [zwycięzcy]` - giveaway w #giveaways, czas np. `30m`, `2h`, `1d12h`.\n"
+     "`/giveaway-end id_wiadomości` - kończy giveaway od razu, a po zakończeniu losuje nowego zwycięzcę."),
+    ("🌴 Komendy dla graczy",
+     "`/rank` - poziom i XP, `/leaderboard` - top 10 najaktywniejszych."),
+    ("⚙️ Działa samo",
+     "• Licznik graczy na górze serwera (co 10 min)\n"
+     "• Post w #updates, gdy opublikujesz nową wersję gry (max 1 na 6 h, `/update` go zastępuje)\n"
+     "• Tickety bez aktywności przez 48 h zamykają się same, zapis rozmowy idzie do #mod-log\n"
+     "• 👍/👎 pod każdą propozycją, autor buga dostaje info po tagu **Fixed**\n"
+     "• #mutation-showcase przyjmuje tylko obrazki\n"
+     "• XP i role za poziomy, Join to Create, logi, AutoMod Discorda"),
+]
+
+
+async def ensure_control_channel(guild):
+    ch = channel(guild, "control")
+    if ch is None:
+        owner_role = role(guild, CONTROL_ROLE)
+        overwrites = {guild.default_role: PO(view_channel=False),
+                      guild.me: PO(view_channel=True, send_messages=True, manage_messages=True)}
+        if owner_role:
+            overwrites[owner_role] = PO(view_channel=True, send_messages=True)
+        ch = await guild.create_text_channel(
+            CH["control"], overwrites=overwrites, topic="Sterowanie botem OASIS - widzi to tylko Owner.",
+            category=discord.utils.get(guild.categories, name=CONTROL_CATEGORY))
+        print(f"+ created {ch.name}")
+    embed = discord.Embed(title="🤖 OASIS Bot - panel sterowania", colour=SAND)
+    for name, value in CONTROL_HELP:
+        embed.add_field(name=name, value=value, inline=False)
+    embed.set_footer(text=f"Wersja: {kv_get('version', 'pierwsze uruchomienie')}")
+    msg_id = kv_get("panel:control")
+    try:
+        msg = await ch.fetch_message(int(msg_id)) if msg_id else None
+    except discord.NotFound:
+        msg = None
+    if msg:
+        await msg.edit(embed=embed)          # keeps the command list current after every update
+    else:
+        msg = await ch.send(embed=embed)
+        await msg.pin()
+        kv_set("panel:control", msg.id)
+    return ch, msg.id
+
+
 async def post_panels(guild):
     await ensure_panel(guild, "verify", discord.Embed(
         title="✅ Verify to enter the oasis",
@@ -381,12 +434,11 @@ async def on_ready():
                 await ch.delete()
             rooms.discard(cid)
     save_temp_rooms(rooms)
-    notice = kv_get("restart_notice")
-    if notice:
+    control, help_id = await ensure_control_channel(guild)
+    if kv_get("restart_notice"):
         kv_set("restart_notice", "")
-        ch = guild.get_channel(int(notice))
-        if ch:
-            await ch.send(kv_get("restart_text", "✅ Bot is back online."))
+        await control.purge(limit=200, check=lambda m: m.id != help_id)      # clean up after the update
+        await control.send(kv_get("restart_text", "✅ Bot is back online."), delete_after=120)
     print(f"OASIS bot online as {bot.user} in {guild.name}")
 
 
@@ -548,6 +600,8 @@ async def github_get(session, url, raw=True):
 async def botupdate(interaction: discord.Interaction):
     if not GITHUB_REPO:
         return await interaction.response.send_message("Set GITHUB_REPO in .env first.", ephemeral=True)
+    if interaction.channel.name != CH["control"]:
+        return await interaction.response.send_message(f"Use this in #{CH['control']}.", ephemeral=True)
     await interaction.response.defer(ephemeral=True, thinking=True)
     api = f"https://api.github.com/repos/{GITHUB_REPO}"
     try:
@@ -581,8 +635,9 @@ async def botupdate(interaction: discord.Interaction):
         await asyncio.to_thread(subprocess.run, [sys.executable, "-m", "pip", "install", "-q", "-r",
                                                  os.path.join(BOT_DIR, "requirements.txt")])
     message = commit["commit"]["message"].splitlines()[0]
-    kv_set("restart_notice", interaction.channel_id)
-    kv_set("restart_text", f"✅ Bot updated and back online: **{message}**")
+    kv_set("restart_notice", "1")
+    kv_set("version", f"{message} ({commit['sha'][:7]})")
+    kv_set("restart_text", f"✅ Bot zaktualizowany i znowu online: **{message}**")
     await interaction.followup.send(f"⬇️ Updated {', '.join(changed)} ({message}). Restarting...")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
