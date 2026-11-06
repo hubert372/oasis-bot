@@ -9,6 +9,8 @@ Features:
   - Logs: joins, leaves, deleted and edited messages
   - XP and levels (/rank, /leaderboard) with Sprout / Gardener / Oasis Master rewards
   - Join to Create voice rooms
+  - Live player counter channel, 👍/👎 on suggestions, "fixed" notice on bug reports,
+    auto-close of inactive tickets, /giveaway, picture-only mutation-showcase
 
 Run:  python oasis_bot.py   (settings in .env, see .env.example)
 """
@@ -18,6 +20,7 @@ import io
 import json
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
@@ -55,6 +58,10 @@ CH = {
     "updates": "📜・updates",
     "jtc":     "➕・Join to Create",
     "staff":   "🔒・staff-chat",
+    "showcase": "✨・mutation-showcase",
+    "suggestions": "💡・suggestions",
+    "bugs":    "🐛・bug-reports",
+    "giveaways": "🎉・giveaways",
 }
 SUPPORT_CATEGORY = "🎫 SUPPORT"
 
@@ -80,6 +87,14 @@ UPDATE_CHECK_MINUTES = 5
 UPDATE_MIN_GAP_HOURS = 6               # max one post per 6 h, so test publishes don't spam
 UPDATE_PING_ROLE = "Update Ping"
 
+# Live player counter (channel at the top of the server, renamed every 10 min)
+PLAYER_COUNT_PREFIX = "🎮 Playing now"
+# Tickets with no new message for this long are closed automatically
+TICKET_AUTOCLOSE_HOURS = 48
+GIVEAWAY_PING_ROLE = "Giveaway Ping"
+SUGGESTION_REACTIONS = ["👍", "👎"]
+FIXED_TAG = "Fixed"
+
 SAND = 0xE8B04B
 GREEN = 0x2ECC71
 RED = 0xE74C3C
@@ -92,6 +107,10 @@ db = sqlite3.connect(DB_PATH)
 db.execute("CREATE TABLE IF NOT EXISTS xp (user_id INTEGER PRIMARY KEY, xp INTEGER NOT NULL DEFAULT 0,"
            " last INTEGER NOT NULL DEFAULT 0)")
 db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS giveaways (message_id INTEGER PRIMARY KEY, channel_id INTEGER,"
+           " prize TEXT, winners INTEGER, end_ts INTEGER, host_id INTEGER, ended INTEGER DEFAULT 0)")
+db.execute("CREATE TABLE IF NOT EXISTS gw_entries (message_id INTEGER, user_id INTEGER,"
+           " PRIMARY KEY (message_id, user_id))")
 db.commit()
 
 
@@ -251,22 +270,28 @@ class CloseTicketView(discord.ui.View):
     async def close(self, interaction: discord.Interaction, _):
         ch = interaction.channel
         owner = ticket_owner_id(ch)
+        if owner is None:
+            return await interaction.response.send_message("This isn't a ticket.", ephemeral=True)
         if not (is_staff(interaction.user) or interaction.user.id == owner):
             return await interaction.response.send_message("You can't close this ticket.", ephemeral=True)
         await interaction.response.send_message("🔒 Closing this ticket in 5 seconds...")
+        await close_ticket(ch, f"closed by {interaction.user.mention}")
 
-        lines = []
-        async for m in ch.history(limit=None, oldest_first=True):
-            extra = " ".join(a.url for a in m.attachments)
-            text = m.content or " ".join(e.title or "" for e in m.embeds)
-            lines.append(f"[{m.created_at:%Y-%m-%d %H:%M}] {m.author}: {text} {extra}".rstrip())
-        transcript = discord.File(io.BytesIO("\n".join(lines).encode("utf-8")), filename=f"{ch.name}.txt")
-        await log(interaction.guild, discord.Embed(
-            description=f"🔒 **{ch.name}** closed by {interaction.user.mention} "
-                        f"(opened by <@{owner}>, {ch.topic.split(' | ')[0] if ch.topic else ''})",
-            colour=RED), file=transcript)
-        await asyncio.sleep(5)
-        await ch.delete(reason="Ticket closed")
+
+async def close_ticket(ch, how):
+    owner = ticket_owner_id(ch)
+    lines = []
+    async for m in ch.history(limit=None, oldest_first=True):
+        extra = " ".join(a.url for a in m.attachments)
+        text = m.content or " ".join(e.title or "" for e in m.embeds)
+        lines.append(f"[{m.created_at:%Y-%m-%d %H:%M}] {m.author}: {text} {extra}".rstrip())
+    transcript = discord.File(io.BytesIO("\n".join(lines).encode("utf-8")), filename=f"{ch.name}.txt")
+    await log(ch.guild, discord.Embed(
+        description=f"🔒 **{ch.name}** {how} "
+                    f"(opened by <@{owner}>, {ch.topic.split(' | ')[0] if ch.topic else ''})",
+        colour=RED), file=transcript)
+    await asyncio.sleep(5)
+    await ch.delete(reason="Ticket closed")
 
 
 # ---------------- panels ----------------
@@ -324,12 +349,13 @@ class OasisBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        for view in (VerifyView(), RolesView(), TicketPanel(), CloseTicketView()):
+        for view in (VerifyView(), RolesView(), TicketPanel(), CloseTicketView(), GiveawayView()):
             self.add_view(view)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        check_game_update.start()
+        for loop in (check_game_update, player_counter, autoclose_tickets, giveaway_timer):
+            loop.start()
 
 
 bot = OasisBot()
@@ -383,6 +409,8 @@ async def on_member_remove(member):
 async def on_message_delete(message):
     if not our_guild(message.guild) or message.author.bot or message.channel.name.startswith("ticket-"):
         return
+    if message.channel.name == CH["showcase"] and not message.attachments:
+        return    # removed by the picture-only filter, not worth logging
     await log(message.guild, discord.Embed(
         description=f"🗑️ Message by {message.author.mention} deleted in {message.channel.mention}\n"
                     f">>> {message.content[:1000] or '*(no text)*'}", colour=RED))
@@ -402,6 +430,15 @@ async def on_message_edit(before, after):
 @bot.event
 async def on_message(message):
     if not our_guild(message.guild) or message.author.bot or message.channel.name.startswith("ticket-"):
+        return
+    # mutation-showcase is a gallery: messages without a picture/video are removed
+    if message.channel.name == CH["showcase"] and not message.attachments and not is_staff(message.author):
+        try:
+            await message.delete()
+            await message.channel.send(f"{message.author.mention} this channel is for pictures only 📸 "
+                                       f"- chat in the other channels!", delete_after=6)
+        except discord.HTTPException:
+            pass
         return
     uid, now = message.author.id, int(time.time())
     row = db.execute("SELECT xp, last FROM xp WHERE user_id=?", (uid,)).fetchone()
@@ -580,18 +617,201 @@ async def on_voice_state_update(member, before, after):
         await before.channel.delete(reason="Empty Join to Create room")
 
 
-# ---- Roblox update watcher ----
+# ---- Suggestions & bug reports (forums) ----
+@bot.event
+async def on_thread_create(thread):
+    if not our_guild(thread.guild) or thread.parent is None or thread.parent.name != CH["suggestions"]:
+        return
+    for _ in range(5):                      # the first post can arrive a moment after the thread
+        try:
+            starter = thread.starter_message or await thread.fetch_message(thread.id)
+            for emoji in SUGGESTION_REACTIONS:
+                await starter.add_reaction(emoji)
+            return
+        except discord.NotFound:
+            await asyncio.sleep(1)
+
+
+@bot.event
+async def on_thread_update(before, after):
+    if not our_guild(after.guild) or after.parent is None or after.parent.name != CH["bugs"]:
+        return
+    had = any(t.name == FIXED_TAG for t in before.applied_tags)
+    has = any(t.name == FIXED_TAG for t in after.applied_tags)
+    if has and not had:
+        await after.send(f"✅ <@{after.owner_id}> this bug has been marked as **fixed** - "
+                         f"thanks for reporting it! 🌴")
+
+
+# ---- Tickets: auto-close inactive ones ----
+@tasks.loop(hours=1)
+async def autoclose_tickets():
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    limit = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=TICKET_AUTOCLOSE_HOURS)
+    for ch in list(guild.text_channels):
+        if ticket_owner_id(ch) is None:
+            continue
+        last = discord.utils.snowflake_time(ch.last_message_id) if ch.last_message_id else ch.created_at
+        if last < limit:
+            await ch.send(f"⏰ No activity for {TICKET_AUTOCLOSE_HOURS} h - closing this ticket. "
+                          f"Open a new one anytime!")
+            await close_ticket(ch, f"auto-closed after {TICKET_AUTOCLOSE_HOURS} h without activity")
+
+
+# ---- Giveaways ----
+def parse_duration(text):
+    total = 0
+    for amount, unit in re.findall(r"(\d+)\s*([dhm])", text.lower()):
+        total += int(amount) * {"d": 86400, "h": 3600, "m": 60}[unit]
+    return total
+
+
+def giveaway_embed(prize, end_ts, winners, entries, host_id, ended_text=None):
+    if ended_text:
+        desc = f"{ended_text}\n\nHosted by <@{host_id}>"
+    else:
+        desc = (f"Click **🎉 Enter** to join!\n\nEnds {discord.utils.format_dt(datetime.datetime.fromtimestamp(end_ts, datetime.timezone.utc), 'R')}"
+                f"\nWinners: **{winners}**\nHosted by <@{host_id}>")
+    embed = discord.Embed(title=f"🎁 {prize}", description=desc, colour=GREEN if ended_text else SAND)
+    embed.set_footer(text=f"Entries: {entries}")
+    return embed
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Enter", emoji="🎉", style=discord.ButtonStyle.success,
+                       custom_id="oasis:gw_enter")
+    async def enter(self, interaction: discord.Interaction, _):
+        mid, uid = interaction.message.id, interaction.user.id
+        row = db.execute("SELECT prize, winners, end_ts, host_id, ended FROM giveaways WHERE message_id=?",
+                         (mid,)).fetchone()
+        if row is None or row[4]:
+            return await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+        if db.execute("SELECT 1 FROM gw_entries WHERE message_id=? AND user_id=?", (mid, uid)).fetchone():
+            db.execute("DELETE FROM gw_entries WHERE message_id=? AND user_id=?", (mid, uid))
+            msg = "You left the giveaway."
+        else:
+            db.execute("INSERT INTO gw_entries VALUES(?, ?)", (mid, uid))
+            msg = "You're in! Good luck 🍀"
+        db.commit()
+        count = db.execute("SELECT COUNT(*) FROM gw_entries WHERE message_id=?", (mid,)).fetchone()[0]
+        prize, winners, end_ts, host_id, _ = row
+        await interaction.response.edit_message(embed=giveaway_embed(prize, end_ts, winners, count, host_id))
+        await interaction.followup.send(msg, ephemeral=True)
+
+
+async def finish_giveaway(message_id, reroll=False):
+    row = db.execute("SELECT channel_id, prize, winners, end_ts, host_id FROM giveaways WHERE message_id=?",
+                     (message_id,)).fetchone()
+    if row is None:
+        return False
+    channel_id, prize, winners, end_ts, host_id = row
+    db.execute("UPDATE giveaways SET ended=1 WHERE message_id=?", (message_id,))
+    db.commit()
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        return False
+    entries = [u for (u,) in db.execute("SELECT user_id FROM gw_entries WHERE message_id=?", (message_id,))]
+    picked = random.sample(entries, min(winners, len(entries)))
+    mentions = ", ".join(f"<@{u}>" for u in picked)
+    try:
+        msg = await ch.fetch_message(message_id)
+        result = f"🏆 Winner{'s' if len(picked) > 1 else ''}: {mentions}" if picked else "Nobody entered 😢"
+        await msg.edit(embed=giveaway_embed(prize, end_ts, winners, len(entries), host_id, result), view=None)
+    except discord.NotFound:
+        msg = None
+    if picked:
+        await ch.send(f"🎉 {'New winner' if reroll else 'Congratulations'} {mentions}! You won **{prize}**! "
+                      f"Open a ticket to claim it.",
+                      reference=msg, allowed_mentions=discord.AllowedMentions(users=True))
+    else:
+        await ch.send(f"Nobody entered the **{prize}** giveaway.")
+    return True
+
+
+@tasks.loop(seconds=30)
+async def giveaway_timer():
+    due = db.execute("SELECT message_id FROM giveaways WHERE ended=0 AND end_ts<=?", (int(time.time()),))
+    for (mid,) in due.fetchall():
+        await finish_giveaway(mid)
+
+
+@bot.tree.command(name="giveaway", description="Start a giveaway in the giveaways channel")
+@app_commands.describe(prize="What can people win", duration="e.g. 30m, 2h, 1d, 1d12h",
+                       winners="How many winners")
+@app_commands.default_permissions(manage_guild=True)
+async def giveaway(interaction: discord.Interaction, prize: str, duration: str,
+                   winners: app_commands.Range[int, 1, 20] = 1):
+    seconds = parse_duration(duration)
+    if seconds < 60:
+        return await interaction.response.send_message("Duration must be at least 1m (e.g. 30m, 2h, 1d).",
+                                                       ephemeral=True)
+    ch = channel(interaction.guild, "giveaways")
+    if ch is None:
+        return await interaction.response.send_message("Giveaways channel not found.", ephemeral=True)
+    end_ts = int(time.time()) + seconds
+    ping = role(interaction.guild, GIVEAWAY_PING_ROLE)
+    msg = await ch.send(content=ping.mention if ping else None,
+                        embed=giveaway_embed(prize, end_ts, winners, 0, interaction.user.id),
+                        view=GiveawayView(),
+                        allowed_mentions=discord.AllowedMentions(roles=[ping] if ping else []))
+    db.execute("INSERT INTO giveaways(message_id, channel_id, prize, winners, end_ts, host_id) "
+               "VALUES(?,?,?,?,?,?)", (msg.id, ch.id, prize, winners, end_ts, interaction.user.id))
+    db.commit()
+    await interaction.response.send_message(f"Giveaway started in {ch.mention}! 🎉", ephemeral=True)
+
+
+@bot.tree.command(name="giveaway-end", description="End a giveaway now, or pick a new winner for an ended one")
+@app_commands.describe(message_id="ID of the giveaway message (right-click it -> Copy Message ID)")
+@app_commands.default_permissions(manage_guild=True)
+async def giveaway_end(interaction: discord.Interaction, message_id: str):
+    row = db.execute("SELECT ended FROM giveaways WHERE message_id=?", (int(message_id),)).fetchone() \
+        if message_id.isdigit() else None
+    if row is None:
+        return await interaction.response.send_message("Giveaway not found.", ephemeral=True)
+    await interaction.response.send_message("Drawing...", ephemeral=True)
+    await finish_giveaway(int(message_id), reroll=bool(row[0]))
+
+
+# ---- Roblox: game info, live player counter, update watcher ----
+async def fetch_game():
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+        universe = kv_get("universe_id")
+        if not universe:
+            async with s.get(f"https://apis.roblox.com/universes/v1/places/{PLACE_ID}/universe") as r:
+                universe = (await r.json())["universeId"]
+            kv_set("universe_id", universe)
+        async with s.get(f"https://games.roblox.com/v1/games?universeIds={universe}") as r:
+            return (await r.json())["data"][0]
+
+
+@tasks.loop(minutes=10)                     # Discord allows only 2 renames per 10 min
+async def player_counter():
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    try:
+        playing = (await fetch_game()).get("playing", 0)
+    except Exception as e:
+        print(f"! player count failed: {e}")
+        return
+    name = f"{PLAYER_COUNT_PREFIX}: {playing}"
+    ch = discord.utils.find(lambda c: c.name.startswith(PLAYER_COUNT_PREFIX), guild.voice_channels)
+    if ch is None:
+        await guild.create_voice_channel(name, position=0, overwrites={
+            guild.default_role: PO(view_channel=True, connect=False)})
+    elif ch.name != name:
+        await ch.edit(name=name)
+
+
 @tasks.loop(minutes=UPDATE_CHECK_MINUTES)
 async def check_game_update():
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
-            universe = kv_get("universe_id")
-            if not universe:
-                async with s.get(f"https://apis.roblox.com/universes/v1/places/{PLACE_ID}/universe") as r:
-                    universe = (await r.json())["universeId"]
-                kv_set("universe_id", universe)
-            async with s.get(f"https://games.roblox.com/v1/games?universeIds={universe}") as r:
-                game = (await r.json())["data"][0]
+        game = await fetch_game()
     except Exception as e:      # Roblox API down or rate limited - try again next loop
         print(f"! update check failed: {e}")
         return
@@ -630,6 +850,9 @@ async def check_game_update():
 
 
 @check_game_update.before_loop
+@player_counter.before_loop
+@autoclose_tickets.before_loop
+@giveaway_timer.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
 
