@@ -22,6 +22,7 @@ import os
 import random
 import re
 import sqlite3
+import unicodedata
 import sys
 import time
 
@@ -50,6 +51,7 @@ GAME_LINK = "https://www.roblox.com/games/86503481593300/oasis-trading"
 
 # Channel names - must match the setup script
 CH = {
+    "welcome": "🌵・welcome",
     "verify":  "✅・verify",
     "roles":   "🎭・get-roles",
     "ticket":  "🎫・create-ticket",
@@ -63,6 +65,7 @@ CH = {
     "bugs":    "🐛・bug-reports",
     "giveaways": "🎉・giveaways",
     "control": "🤖・bot-control",
+    "joins":   "👋・new-players",
 }
 CONTROL_CATEGORY = "🛠️ STAFF"
 CONTROL_ROLE = "Owner"          # only this role (and the bot) can see the control channel
@@ -107,6 +110,9 @@ BAD_EXACT = {"ass", "dick", "cock", "pussy", "fag", "sex", "nude", "nudes", "rap
 BAD_PHRASES = ("kill yourself", "kill urself", "kill your self", "go die")
 SPAM_MESSAGES, SPAM_SECONDS = 5, 6        # 5 messages in 6 s = spam
 SPAM_REPEATS = 3                          # the same message 3x in 20 s = spam
+MENTION_LIMIT = 5                         # pinging 5+ people/roles in one message
+INVITE_RE = re.compile(r"(discord\.gg|discord(app)?\.com/invite)/\S+", re.I)
+DISABLE_DISCORD_AUTOMOD = True            # remove Discord's built-in AutoMod rules - the bot handles it
 WARN_WINDOW_DAYS = 30                     # warnings older than this don't count toward punishments
 WARN_PUNISHMENTS = {                      # active warnings -> timeout length
     2: datetime.timedelta(minutes=10),
@@ -194,12 +200,30 @@ class VerifyView(discord.ui.View):
             return await interaction.response.send_message("You're already verified! 🌴", ephemeral=True)
         await member.add_roles(*roles, reason="Verified")
         await interaction.response.send_message("You're verified - welcome to OASIS! 🌴", ephemeral=True)
-        general = channel(interaction.guild, "general")
-        if general:
-            await general.send(embed=discord.Embed(
+        joins = await ensure_joins_channel(interaction.guild)
+        if joins:
+            await joins.send(embed=discord.Embed(
                 description=f"🌴 Welcome to the oasis, {member.mention}! Grab your ping roles in "
                             f"{channel(interaction.guild, 'roles').mention if channel(interaction.guild, 'roles') else '#get-roles'} "
                             f"and [jump into the game]({GAME_LINK})!", colour=SAND))
+
+
+async def ensure_joins_channel(guild):
+    ch = channel(guild, "joins")
+    if ch is None:
+        verified = role(guild, "Verified Player")
+        overwrites = {guild.default_role: PO(view_channel=False, send_messages=False),
+                      guild.me: PO(view_channel=True, send_messages=True)}
+        if verified:
+            overwrites[verified] = PO(view_channel=True, send_messages=False, add_reactions=True)
+        welcome = channel(guild, "welcome") if "welcome" in CH else None
+        ch = await guild.create_text_channel(
+            CH["joins"], overwrites=overwrites, topic="New players joining the oasis 🌴",
+            category=welcome.category if welcome else None)
+        if welcome:
+            await ch.edit(position=welcome.position + 1)
+        print(f"+ created {ch.name}")
+    return ch
 
 
 # ---------------- ping roles ----------------
@@ -360,10 +384,12 @@ CONTROL_HELP = [
      "• Licznik graczy na górze serwera (co 10 min)\n"
      "• Post w #updates, gdy opublikujesz nową wersję gry (max 1 na 6 h, `/update` go zastępuje)\n"
      "• Ticket: gdy staff odpisze, a gracz milczy 24 h - ping z licznikiem; po kolejnych 24 h ticket się zamyka\n"
-     "• Własny AutoMod: przekleństwa po angielsku (też f.u.c.k, sh1t itp.) i spam = usunięcie + ostrzeżenie\n"
+     "• Własny AutoMod (zamiast AutoModa Discorda): przekleństwa po angielsku (też f.u.c.kk, f u c k, sh1t, fück), "
+     "spam, zaproszenia na inne serwery, masowe pingi = usunięcie + ostrzeżenie\n"
      "• 👍/👎 pod każdą propozycją, autor buga dostaje info po tagu **Fixed**\n"
      "• #mutation-showcase przyjmuje tylko obrazki\n"
-     "• XP i role za poziomy, Join to Create, AutoMod Discorda\n"
+     "• XP i role za poziomy, Join to Create\n"
+     "• Powitania nowych graczy w #new-players (nie na #general)\n"
      "• #mod-log: tylko usunięte/edytowane wiadomości, ostrzeżenia, wyciszenia, /clear i tickety"),
 ]
 
@@ -468,6 +494,11 @@ async def on_ready():
             rooms.discard(cid)
     save_temp_rooms(rooms)
     control, help_id = await ensure_control_channel(guild)
+    await ensure_joins_channel(guild)
+    if DISABLE_DISCORD_AUTOMOD:
+        for rule in await guild.fetch_automod_rules():
+            await rule.delete(reason="OASIS bot runs its own AutoMod")
+            print(f"- removed Discord AutoMod rule: {rule.name}")
     if kv_get("restart_notice"):
         kv_set("restart_notice", "")
         await control.purge(limit=200, check=lambda m: m.id != help_id)      # clean up after the update
@@ -480,16 +511,48 @@ LEET = str.maketrans({"0": "o", "1": "i", "!": "i", "|": "i", "3": "e", "4": "a"
                       "5": "s", "$": "s", "7": "t", "+": "t", "8": "b", "9": "g"})
 
 
+LOOKALIKES = str.maketrans({"а": "a", "е": "e", "о": "o", "с": "c", "р": "p", "х": "x", "у": "y",
+                            "і": "i", "к": "k", "м": "m", "т": "t", "н": "h", "в": "b", "ѕ": "s"})
+
+
+def _variants(word):
+    out = {word, re.sub(r"(.)\1+", r"\1", word)}           # "fuuuckk" -> "fuck"
+    out |= {w.replace("ph", "f") for w in out}             # "phuck" -> "fuck"
+    return out
+
+
+def _is_bad(word, strict=True):
+    for w in _variants(word):
+        if w in BAD_EXACT or any(b in w for b in BAD_CONTAINS):
+            return True
+        if strict and w.startswith(BAD_PREFIX):
+            return True
+    return False
+
+
 def bad_word_in(text):
-    t = text.lower().translate(LEET)
-    t = re.sub(r"(?<=\b\w)[\s.\-_*]+(?=\w\b)", "", t)        # "f u c k" / "f.u.c.k" -> "fuck"
-    joined = " ".join(re.findall(r"[a-z]+", t))
-    if any(re.search(rf"\b{re.escape(p)}\b", joined) for p in BAD_PHRASES):
+    t = unicodedata.normalize("NFKD", text)
+    t = "".join(c for c in t if not unicodedata.combining(c))  # "fück" -> "fuck"
+    t = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", t)          # invisible characters
+    t = t.lower().translate(LOOKALIKES).translate(LEET)
+    tokens = re.findall(r"[a-z]+", t)
+    if any(re.search(rf"\b{re.escape(p)}\b", " ".join(tokens)) for p in BAD_PHRASES):
         return True
-    for word in joined.split():
-        for w in {word, re.sub(r"(.)\1+", r"\1", word)}:     # also check "fuuuck" -> "fuck"
-            if w in BAD_EXACT or w.startswith(BAD_PREFIX) or any(b in w for b in BAD_CONTAINS):
-                return True
+    if any(_is_bad(tok) for tok in tokens):
+        return True
+    # pieces split by dots/spaces: "f.u.c.kk", "f u c k", "b i t c h"
+    run = []
+    for tok in tokens + [""]:
+        if 0 < len(tok) <= 2:
+            run.append(tok)
+            continue
+        if len(run) >= 2 and _is_bad("".join(run)):
+            return True
+        run = []
+    # two neighbours where one is a short piece: "fuc k", "fu ck", "sh it"
+    for a, b in zip(tokens, tokens[1:]):
+        if (len(a) <= 2 or len(b) <= 2) and _is_bad(a + b, strict=False):
+            return True
     return False
 
 
@@ -533,6 +596,8 @@ async def add_warn(member, reason, moderator=None):
     return count, punish
 
 
+AUTOMOD_SAYS = {"Bad language": "watch your language", "Spam": "slow down",
+                "Server invite links": "no server invites here", "Mass mentions": "don't mass-ping people"}
 spam_tracker = {}       # user_id -> [(time, content), ...]
 last_auto_warn = {}     # user_id -> time, so one burst of spam gives one warning
 automod_deleted = set()  # ids removed by AutoMod (already logged as a warning)
@@ -555,6 +620,10 @@ async def automod_check(message):
         repeats = message.content and sum(1 for _, c in history if c == history[-1][1]) >= SPAM_REPEATS
         if burst or repeats:
             reason = "Spam"
+        elif INVITE_RE.search(message.content):
+            reason = "Server invite links"
+        elif len(message.mentions) + len(message.role_mentions) >= MENTION_LIMIT or message.mention_everyone:
+            reason = "Mass mentions"
     if reason is None:
         return False
     automod_deleted.add(message.id)
@@ -567,7 +636,7 @@ async def automod_check(message):
         last_auto_warn[member.id] = now
         count, punish = await add_warn(member, f"{reason} (auto)")
         await message.channel.send(
-            f"⚠️ {member.mention} {'watch your language' if reason == 'Bad language' else 'slow down'}! "
+            f"⚠️ {member.mention} {AUTOMOD_SAYS.get(reason, 'please follow the rules')}! "
             f"Warning {count}" + (f" - muted for {fmt_delta(punish)}." if punish else "."), delete_after=10)
     return True
 
