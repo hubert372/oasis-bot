@@ -68,7 +68,8 @@ CH = {
     "joins":   "👋・new-players",
 }
 CONTROL_CATEGORY = "🛠️ STAFF"
-CONTROL_ROLE = "Owner"          # only this role (and the bot) can see the control channel
+CONTROL_ROLE = "Owner"
+BOT_ROLE = ("Bot", 0x5865F2)    # every bot on the server gets this rank, shown separately in the member list          # only this role (and the bot) can see the control channel
 SUPPORT_CATEGORY = "🎫 SUPPORT"
 
 STAFF = ["Owner", "Developer", "Admin", "Moderator"]
@@ -224,6 +225,24 @@ async def ensure_joins_channel(guild):
             await ch.edit(position=welcome.position + 1)
         print(f"+ created {ch.name}")
     return ch
+
+
+async def ensure_bot_role(guild):
+    name, colour = BOT_ROLE
+    r = role(guild, name)
+    if r is None:
+        r = await guild.create_role(name=name, colour=discord.Colour(colour), hoist=True,
+                                    permissions=discord.Permissions.none(), reason="Rank for bots")
+        mod = role(guild, "Moderator")
+        try:
+            await r.edit(position=max(1, mod.position - 1) if mod else 1)   # right below Moderator
+        except discord.HTTPException:
+            pass
+        print(f"+ created role {name}")
+    for m in guild.members:
+        if m.bot and r not in m.roles and r < guild.me.top_role:
+            await m.add_roles(r, reason="Bot rank")
+    return r
 
 
 # ---------------- ping roles ----------------
@@ -388,7 +407,7 @@ CONTROL_HELP = [
      "spam, zaproszenia na inne serwery, masowe pingi = usunięcie + ostrzeżenie\n"
      "• 👍/👎 pod każdą propozycją, autor buga dostaje info po tagu **Fixed**\n"
      "• #mutation-showcase przyjmuje tylko obrazki\n"
-     "• XP i role za poziomy, Join to Create\n"
+     "• XP i role za poziomy, Join to Create, ranga Bot dla każdego bota\n"
      "• Powitania nowych graczy w #new-players (nie na #general)\n"
      "• #mod-log: tylko usunięte/edytowane wiadomości, ostrzeżenia, wyciszenia, /clear i tickety"),
 ]
@@ -495,6 +514,7 @@ async def on_ready():
     save_temp_rooms(rooms)
     control, help_id = await ensure_control_channel(guild)
     await ensure_joins_channel(guild)
+    await ensure_bot_role(guild)
     if DISABLE_DISCORD_AUTOMOD:
         for rule in await guild.fetch_automod_rules():
             await rule.delete(reason="OASIS bot runs its own AutoMod")
@@ -707,6 +727,12 @@ async def unmute(interaction: discord.Interaction, member: discord.Member):
 
 
 # ---- logs ----
+@bot.event
+async def on_member_join(member):
+    if our_guild(member.guild) and member.bot:          # new bots get the Bot rank automatically
+        await ensure_bot_role(member.guild)
+
+
 # ---- /clear ----
 FULL_CLEAR_WORDS = {"all", "full", "everything", "wszystko"}
 clearing_channels = set()   # no delete-logs while /clear runs
