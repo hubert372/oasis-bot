@@ -58,6 +58,7 @@ CH = {
     "general": "💬・general",
     "modlog":  "📋・mod-log",
     "updates": "📜・updates",
+    "announcements": "📢・announcements",
     "jtc":     "➕・Join to Create",
     "staff":   "🔒・staff-chat",
     "showcase": "✨・mutation-showcase",
@@ -387,6 +388,8 @@ CONTROL_HELP = [
      "`/botupdate` - pobiera nowy kod bota z GitHuba i restartuje bota. Po restarcie kanał sam się czyści.\n"
      "`/panels` - wystawia od nowa panele weryfikacji, ról i ticketów (gdy ktoś je usunie)."),
     ("📢 Komendy staffu (działają na każdym kanale)",
+     "`/announce ping` - okienko z ogłoszeniem (tytuł, treść, obrazek, przycisk Play); post idzie do "
+     "#announcements z wybranym pingiem (@everyone, role Ping albo bez pingu).\n"
      "`/update` - okienko z patch notes; post idzie do #updates z pingiem Update Ping.\n"
      "`/giveaway nagroda czas [zwycięzcy]` - giveaway w #giveaways, czas np. `30m`, `2h`, `1d12h`.\n"
      "`/giveaway-end id_wiadomości` - kończy giveaway od razu, a po zakończeniu losuje nowego zwycięzcę.\n"
@@ -900,6 +903,63 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=discord.Embed(title="🏆 OASIS Leaderboard", description=text, colour=SAND),
         allowed_mentions=discord.AllowedMentions.none())
+
+
+class AnnounceModal(discord.ui.Modal, title="New OASIS announcement"):
+    headline = discord.ui.TextInput(label="Title", placeholder="OASIS is OUT NOW! 🌴", max_length=200)
+    body = discord.ui.TextInput(label="Message", style=discord.TextStyle.paragraph, max_length=3800,
+                                placeholder="The desert is open! Plant, grow and sell...")
+    image = discord.ui.TextInput(label="Image link (optional)", required=False, placeholder="https://...png")
+    play = discord.ui.TextInput(label="Add a Play button? (yes / no)", required=False, default="yes",
+                                max_length=3)
+
+    def __init__(self, ping: str):
+        super().__init__()
+        self.ping = ping
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ch = channel(interaction.guild, "announcements")
+        if ch is None:
+            return await interaction.response.send_message("Announcements channel not found.", ephemeral=True)
+        embed = discord.Embed(title=self.headline.value, description=self.body.value, colour=SAND,
+                              timestamp=datetime.datetime.now(datetime.timezone.utc))
+        if self.image.value.startswith("http"):
+            embed.set_image(url=self.image.value)
+        embed.set_footer(text="OASIS", icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+        view = None
+        if self.play.value.strip().lower() not in ("no", "n", "nie"):
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Play OASIS", emoji="🎮", url=GAME_LINK))
+        if self.ping == "everyone":
+            content, mentions = "@everyone", discord.AllowedMentions(everyone=True)
+        elif self.ping == "none":
+            content, mentions = None, discord.AllowedMentions.none()
+        else:
+            r = role(interaction.guild, self.ping)
+            content = r.mention if r else None
+            mentions = discord.AllowedMentions(roles=[r] if r else [])
+        msg = await ch.send(content=content, embed=embed, view=view, allowed_mentions=mentions)
+        if ch.is_news():
+            try:
+                await msg.publish()
+            except discord.HTTPException:
+                pass
+        await interaction.response.send_message(f"Announcement posted in {ch.mention}! 📢", ephemeral=True)
+
+
+@bot.tree.command(name="announce", description="Post an announcement in the announcements channel")
+@app_commands.describe(ping="Who gets pinged")
+@app_commands.choices(ping=[
+    app_commands.Choice(name="@everyone", value="everyone"),
+    app_commands.Choice(name="Update Ping", value="Update Ping"),
+    app_commands.Choice(name="Event Ping", value="Event Ping"),
+    app_commands.Choice(name="Giveaway Ping", value="Giveaway Ping"),
+    app_commands.Choice(name="Sneak Peek Ping", value="Sneak Peek Ping"),
+    app_commands.Choice(name="No ping", value="none"),
+])
+@app_commands.default_permissions(manage_guild=True)
+async def announce(interaction: discord.Interaction, ping: app_commands.Choice[str]):
+    await interaction.response.send_modal(AnnounceModal(ping.value))
 
 
 class UpdateModal(discord.ui.Modal, title="Post OASIS patch notes"):
