@@ -59,6 +59,7 @@ CH = {
     "modlog":  "📋・mod-log",
     "updates": "📜・updates",
     "announcements": "📢・announcements",
+    "codes":   "🎟️・codes",
     "jtc":     "➕・Join to Create",
     "staff":   "🔒・staff-chat",
     "showcase": "✨・mutation-showcase",
@@ -142,6 +143,8 @@ db.execute("CREATE TABLE IF NOT EXISTS giveaways (message_id INTEGER PRIMARY KEY
            " prize TEXT, winners INTEGER, end_ts INTEGER, host_id INTEGER, ended INTEGER DEFAULT 0)")
 db.execute("CREATE TABLE IF NOT EXISTS warns (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,"
            " mod_id INTEGER, reason TEXT, ts INTEGER)")
+db.execute("CREATE TABLE IF NOT EXISTS codes (code TEXT PRIMARY KEY, reward TEXT, expires INTEGER,"
+           " message_id INTEGER, active INTEGER DEFAULT 1)")
 db.execute("CREATE TABLE IF NOT EXISTS gw_entries (message_id INTEGER, user_id INTEGER,"
            " PRIMARY KEY (message_id, user_id))")
 db.commit()
@@ -391,6 +394,9 @@ CONTROL_HELP = [
      "`/announce ping` - okienko z ogłoszeniem (tytuł, treść, obrazek, przycisk Play); post idzie do "
      "#announcements z wybranym pingiem (@everyone, role Ping albo bez pingu).\n"
      "`/update` - okienko z patch notes; post idzie do #updates z pingiem Update Ping.\n"
+     "`/code-add kod nagroda [wygasa] [ping]` - nowy kod w #codes, np. `/code-add SANDSTORM 500 coins 3d`\n"
+     "`/code-remove kod [delete]` - kod dostaje dopisek EXPIRED (albo `delete: True` usuwa post)\n"
+     "`/code-list` - wszystkie kody; kody z datą wygasają same\n"
      "`/giveaway nagroda czas [zwycięzcy]` - giveaway w #giveaways, czas np. `30m`, `2h`, `1d12h`.\n"
      "`/giveaway-end id_wiadomości` - kończy giveaway od razu, a po zakończeniu losuje nowego zwycięzcę.\n"
      "`/clear okres [gracz]` - czyści kanał, w którym to wpiszesz: `30m`, `2h`, `1d`, `7d` albo `all` "
@@ -488,7 +494,7 @@ class OasisBot(discord.Client):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        for loop in (check_game_update, player_counter, autoclose_tickets, giveaway_timer):
+        for loop in (check_game_update, player_counter, autoclose_tickets, giveaway_timer, expire_codes):
             loop.start()
 
 
@@ -517,6 +523,7 @@ async def on_ready():
     save_temp_rooms(rooms)
     control, help_id = await ensure_control_channel(guild)
     await ensure_joins_channel(guild)
+    await ensure_codes_channel(guild)
     await ensure_bot_role(guild)
     if DISABLE_DISCORD_AUTOMOD:
         for rule in await guild.fetch_automod_rules():
@@ -903,6 +910,123 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=discord.Embed(title="🏆 OASIS Leaderboard", description=text, colour=SAND),
         allowed_mentions=discord.AllowedMentions.none())
+
+
+# ---- Codes channel ----
+async def ensure_codes_channel(guild):
+    ch = channel(guild, "codes")
+    if ch is None:
+        verified = role(guild, "Verified Player")
+        overwrites = {guild.default_role: PO(view_channel=False, send_messages=False),
+                      guild.me: PO(view_channel=True, send_messages=True)}
+        if verified:
+            overwrites[verified] = PO(view_channel=True, send_messages=False, add_reactions=True)
+        updates = channel(guild, "updates")
+        ch = await guild.create_text_channel(
+            CH["codes"], overwrites=overwrites, topic="Active OASIS codes - redeem them in the game! 🎟️",
+            category=updates.category if updates else None)
+        if updates:
+            await ch.edit(position=updates.position + 1)
+        print(f"+ created {ch.name}")
+    return ch
+
+
+def code_embed(code, reward, expires, active=True):
+    if active:
+        desc = f"🎁 **Reward:** {reward}\n" + (f"⏳ **Expires** <t:{expires}:R>" if expires else "⏳ No expiry date")
+        embed = discord.Embed(title=f"🎟️ {code}", description=desc, colour=GREEN)
+        embed.set_footer(text="Copy the code from the title and redeem it in OASIS!")
+    else:
+        embed = discord.Embed(title=f"~~{code}~~ - EXPIRED", description=f"~~{reward}~~", colour=0x95A5A6)
+    return embed
+
+
+async def expire_code(guild, code, delete=False):
+    row = db.execute("SELECT reward, expires, message_id FROM codes WHERE code=?", (code,)).fetchone()
+    if row is None:
+        return False
+    reward, expires, message_id = row
+    if delete:
+        db.execute("DELETE FROM codes WHERE code=?", (code,))
+    else:
+        db.execute("UPDATE codes SET active=0 WHERE code=?", (code,))
+    db.commit()
+    ch = channel(guild, "codes")
+    if ch and message_id:
+        try:
+            msg = await ch.fetch_message(message_id)
+            if delete:
+                await msg.delete()
+            else:
+                await msg.edit(content=None, embed=code_embed(code, reward, expires, active=False))
+        except discord.NotFound:
+            pass
+    return True
+
+
+async def code_autocomplete(interaction: discord.Interaction, current: str):
+    rows = db.execute("SELECT code FROM codes WHERE code LIKE ? ORDER BY active DESC, code LIMIT 25",
+                      (f"%{current}%",)).fetchall()
+    return [app_commands.Choice(name=c, value=c) for (c,) in rows]
+
+
+@bot.tree.command(name="code-add", description="Post a new game code in the codes channel")
+@app_commands.describe(code="The code exactly as players type it", reward="What the code gives",
+                       expires="Optional: when it stops working, e.g. 3d, 12h", ping="Ping Update Ping?")
+@app_commands.default_permissions(manage_guild=True)
+async def code_add(interaction: discord.Interaction, code: str, reward: str, expires: str | None = None,
+                   ping: bool = False):
+    code = code.strip()
+    if db.execute("SELECT 1 FROM codes WHERE code=? AND active=1", (code,)).fetchone():
+        return await interaction.response.send_message(f"`{code}` is already active.", ephemeral=True)
+    exp_ts = None
+    if expires:
+        seconds = parse_duration(expires)
+        if seconds < 60:
+            return await interaction.response.send_message("Expiry e.g. `12h`, `3d`, `1d12h`.", ephemeral=True)
+        exp_ts = int(time.time()) + seconds
+    ch = await ensure_codes_channel(interaction.guild)
+    r = role(interaction.guild, UPDATE_PING_ROLE) if ping else None
+    msg = await ch.send(content=f"{r.mention} New code! 🎉" if r else None,
+                        embed=code_embed(code, reward, exp_ts),
+                        allowed_mentions=discord.AllowedMentions(roles=[r] if r else []))
+    db.execute("INSERT OR REPLACE INTO codes(code, reward, expires, message_id, active) VALUES(?,?,?,?,1)",
+               (code, reward, exp_ts, msg.id))
+    db.commit()
+    await interaction.response.send_message(f"✅ Code `{code}` posted in {ch.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="code-remove", description="Remove a code (mark it EXPIRED or delete its post)")
+@app_commands.describe(code="Which code", delete="True = delete the post completely, False = show it as EXPIRED")
+@app_commands.autocomplete(code=code_autocomplete)
+@app_commands.default_permissions(manage_guild=True)
+async def code_remove(interaction: discord.Interaction, code: str, delete: bool = False):
+    if await expire_code(interaction.guild, code, delete):
+        await interaction.response.send_message(
+            f"🗑️ `{code}` {'deleted' if delete else 'marked as EXPIRED'}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"No code `{code}`.", ephemeral=True)
+
+
+@bot.tree.command(name="code-list", description="Show all codes")
+@app_commands.default_permissions(manage_guild=True)
+async def code_list(interaction: discord.Interaction):
+    rows = db.execute("SELECT code, reward, expires, active FROM codes ORDER BY active DESC, code").fetchall()
+    text = "\n".join(f"{'✅' if a else '❌'} `{c}` - {r}" + (f" (expires <t:{e}:R>)" if a and e else "")
+                     for c, r, e, a in rows) or "No codes yet."
+    await interaction.response.send_message(embed=discord.Embed(title="🎟️ Codes", description=text[:4000],
+                                                                colour=SAND), ephemeral=True)
+
+
+@tasks.loop(minutes=5)
+async def expire_codes():
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    due = db.execute("SELECT code FROM codes WHERE active=1 AND expires IS NOT NULL AND expires<=?",
+                     (int(time.time()),)).fetchall()
+    for (code,) in due:
+        await expire_code(guild, code)
 
 
 class AnnounceModal(discord.ui.Modal, title="New OASIS announcement"):
@@ -1347,6 +1471,7 @@ async def check_game_update():
 @player_counter.before_loop
 @autoclose_tickets.before_loop
 @giveaway_timer.before_loop
+@expire_codes.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
 
