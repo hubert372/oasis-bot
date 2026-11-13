@@ -60,6 +60,7 @@ CH = {
     "updates": "📜・updates",
     "announcements": "📢・announcements",
     "codes":   "🎟️・codes",
+    "tracker": "👀・player-tracker",
     "jtc":     "➕・Join to Create",
     "staff":   "🔒・staff-chat",
     "showcase": "✨・mutation-showcase",
@@ -70,6 +71,13 @@ CH = {
     "joins":   "👋・new-players",
 }
 CONTROL_CATEGORY = "🛠️ STAFF"
+
+# In-game player tracker (owner-only channel). Roblox gives no names from outside the game,
+# so players are recognised by their avatar picture.
+TRACKER_IGNORE_USER_IDS = [507897662]     # Roblox user IDs that never trigger a ping (the owner)
+TRACKER_POLL_SECONDS = 60
+TRACKER_MISS_LIMIT = 2                    # checks in a row a player must be missing to count as "left"
+TRACKER_MAX_PLAYERS = 30                  # above this the tracker stays quiet (it would be spam)
 CONTROL_ROLE = "Owner"
 BOT_ROLE = ("Bot", 0x5865F2)    # every bot on the server gets this rank, shown separately in the member list          # only this role (and the bot) can see the control channel
 SUPPORT_CATEGORY = "🎫 SUPPORT"
@@ -389,7 +397,9 @@ async def ensure_panel(guild, key, embed, view):
 CONTROL_HELP = [
     ("🔧 Komendy tylko dla ciebie (wpisuj tutaj)",
      "`/botupdate` - pobiera nowy kod bota z GitHuba i restartuje bota. Po restarcie kanał sam się czyści.\n"
-     "`/panels` - wystawia od nowa panele weryfikacji, ról i ticketów (gdy ktoś je usunie)."),
+     "`/panels` - wystawia od nowa panele weryfikacji, ról i ticketów (gdy ktoś je usunie).\n"
+     "`/tracker on|off` - włącza/wyłącza śledzenie graczy w grze (#player-tracker: ping, gdy ktoś wejdzie "
+     "do OASIS, i notatka z czasem gry, gdy wyjdzie)."),
     ("📢 Komendy staffu (działają na każdym kanale)",
      "`/announce ping` - okienko z ogłoszeniem (tytuł, treść, obrazek, przycisk Play); post idzie do "
      "#announcements z wybranym pingiem (@everyone, role Ping albo bez pingu).\n"
@@ -494,7 +504,8 @@ class OasisBot(discord.Client):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        for loop in (check_game_update, player_counter, autoclose_tickets, giveaway_timer, expire_codes):
+        for loop in (check_game_update, player_counter, autoclose_tickets, giveaway_timer, expire_codes,
+                     player_tracker):
             loop.start()
 
 
@@ -524,6 +535,7 @@ async def on_ready():
     control, help_id = await ensure_control_channel(guild)
     await ensure_joins_channel(guild)
     await ensure_codes_channel(guild)
+    await ensure_tracker_channel(guild)
     await ensure_bot_role(guild)
     if DISABLE_DISCORD_AUTOMOD:
         for rule in await guild.fetch_automod_rules():
@@ -1029,6 +1041,118 @@ async def expire_codes():
         await expire_code(guild, code)
 
 
+# ---- In-game player tracker (owner-only) ----
+async def ensure_tracker_channel(guild):
+    ch = channel(guild, "tracker")
+    if ch is None:
+        owner_role = role(guild, CONTROL_ROLE)
+        overwrites = {guild.default_role: PO(view_channel=False),
+                      guild.me: PO(view_channel=True, send_messages=True)}
+        if owner_role:
+            overwrites[owner_role] = PO(view_channel=True, send_messages=True)
+        ch = await guild.create_text_channel(
+            CH["tracker"], overwrites=overwrites, topic="Kto wchodzi do OASIS i ile gra - widzi to tylko Owner.",
+            category=discord.utils.get(guild.categories, name=CONTROL_CATEGORY))
+        print(f"+ created {ch.name}")
+    return ch
+
+
+def fmt_played(seconds):
+    seconds = max(60, int(seconds))
+    h, m = seconds // 3600, (seconds % 3600) // 60
+    return f"{h} h {m} min" if h else f"{m} min"
+
+
+async def fetch_ingame_avatars():
+    """Avatar pictures of everyone in the game right now -> (set of image urls, all_resolved)."""
+    thumb = {"type": "AvatarHeadshot", "size": "150x150", "format": "png", "isCircular": False}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
+        tokens, cursor = [], ""
+        for _ in range(3):
+            url = (f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public?sortOrder=Asc&limit=100"
+                   + (f"&cursor={cursor}" if cursor else ""))
+            async with s.get(url) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"server list answered {r.status}")
+                data = await r.json()
+            for server in data.get("data", []):
+                tokens += server.get("playerTokens", [])
+            cursor = data.get("nextPageCursor")
+            if not cursor:
+                break
+        reqs = [{"requestId": f"t{i}", "token": t, **thumb} for i, t in enumerate(tokens)]
+        reqs += [{"requestId": f"u{uid}", "targetId": uid, **thumb} for uid in TRACKER_IGNORE_USER_IDS]
+        players, ignored, resolved = [], set(), True
+        for i in range(0, len(reqs), 100):
+            async with s.post("https://thumbnails.roblox.com/v1/batch", json=reqs[i:i + 100]) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"thumbnails answered {r.status}")
+                for item in (await r.json()).get("data", []):
+                    url = item.get("imageUrl")
+                    if item.get("requestId", "").startswith("u"):
+                        if url:
+                            ignored.add(url)
+                    elif url and item.get("state") == "Completed":
+                        players.append(url)
+                    else:
+                        resolved = False
+    return set(players) - ignored, resolved
+
+
+@tasks.loop(seconds=TRACKER_POLL_SECONDS)
+async def player_tracker():
+    if kv_get("tracker_enabled", "1") != "1":
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    try:
+        current, resolved = await fetch_ingame_avatars()
+    except Exception as e:
+        print(f"! player tracker failed: {e}")
+        return
+    if len(current) > TRACKER_MAX_PLAYERS:
+        return
+    state = json.loads(kv_get("tracker_state") or "{}")
+    ch = await ensure_tracker_channel(guild)
+    now = int(time.time())
+    for url in current:
+        if url in state:
+            state[url]["miss"] = 0
+            continue
+        embed = discord.Embed(description=f"🟢 **Gracz wszedł do OASIS** <t:{now}:t>\nW grze teraz: {len(current)}",
+                              colour=GREEN)
+        embed.set_thumbnail(url=url)
+        msg = await ch.send(content=f"<@{guild.owner_id}>", embed=embed,
+                            allowed_mentions=discord.AllowedMentions(users=True))
+        state[url] = {"start": now, "msg": msg.id, "miss": 0}
+    if resolved:
+        for url in [u for u in state if u not in current]:
+            state[url]["miss"] += 1
+            if state[url]["miss"] < TRACKER_MISS_LIMIT:
+                continue
+            info = state.pop(url)
+            played = now - info["start"] - (TRACKER_MISS_LIMIT - 1) * TRACKER_POLL_SECONDS
+            embed = discord.Embed(description=f"🔴 **Gracz wyszedł** - był w grze ok. **{fmt_played(played)}**",
+                                  colour=RED)
+            embed.set_thumbnail(url=url)
+            await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+                          reference=ch.get_partial_message(info["msg"]).to_reference(fail_if_not_exists=False))
+    kv_set("tracker_state", json.dumps(state))
+
+
+@bot.tree.command(name="tracker", description="Turn the in-game player tracker on or off")
+@app_commands.choices(state=[app_commands.Choice(name="on", value="1"),
+                             app_commands.Choice(name="off", value="0")])
+@app_commands.default_permissions(administrator=True)
+async def tracker(interaction: discord.Interaction, state: app_commands.Choice[str]):
+    kv_set("tracker_enabled", state.value)
+    kv_set("tracker_state", "{}")
+    await interaction.response.send_message(
+        "👀 Śledzenie graczy **włączone**." if state.value == "1" else "😴 Śledzenie graczy **wyłączone**.",
+        ephemeral=True)
+
+
 class AnnounceModal(discord.ui.Modal, title="New OASIS announcement"):
     headline = discord.ui.TextInput(label="Title", placeholder="OASIS is OUT NOW! 🌴", max_length=200)
     body = discord.ui.TextInput(label="Message", style=discord.TextStyle.paragraph, max_length=3800,
@@ -1472,6 +1596,7 @@ async def check_game_update():
 @autoclose_tickets.before_loop
 @giveaway_timer.before_loop
 @expire_codes.before_loop
+@player_tracker.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
 
