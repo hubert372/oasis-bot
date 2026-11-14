@@ -72,9 +72,8 @@ CH = {
 }
 CONTROL_CATEGORY = "🛠️ STAFF"
 
-# In-game player tracker (owner-only channel). Roblox gives no names from outside the game,
-# so players are recognised by their avatar picture.
-TRACKER_IGNORE_USER_IDS = [507897662]     # Roblox user IDs that never trigger a ping (the owner)
+# In-game player tracker (owner-only channel). Roblox gives only player COUNTS per server from
+# outside the game (no names, no avatars), so the tracker follows how many people are on each server.
 TRACKER_POLL_SECONDS = 60
 TRACKER_MISS_LIMIT = 2                    # checks in a row a player must be missing to count as "left"
 TRACKER_MAX_PLAYERS = 30                  # above this the tracker stays quiet (it would be spam)
@@ -1063,11 +1062,10 @@ def fmt_played(seconds):
     return f"{h} h {m} min" if h else f"{m} min"
 
 
-async def fetch_ingame_avatars():
-    """Avatar pictures of everyone in the game right now -> (set of image urls, all_resolved)."""
-    thumb = {"type": "AvatarHeadshot", "size": "150x150", "format": "png", "isCircular": False}
+async def fetch_game_servers():
+    """Public servers of the game -> {server_id: players}. Roblox gives only counts, no names."""
+    servers, cursor = {}, ""
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
-        tokens, cursor = [], ""
         for _ in range(3):
             url = (f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public?sortOrder=Asc&limit=100"
                    + (f"&cursor={cursor}" if cursor else ""))
@@ -1076,27 +1074,34 @@ async def fetch_ingame_avatars():
                     raise RuntimeError(f"server list answered {r.status}")
                 data = await r.json()
             for server in data.get("data", []):
-                tokens += server.get("playerTokens", [])
+                if server.get("playing", 0) > 0:
+                    servers[server["id"]] = server["playing"]
             cursor = data.get("nextPageCursor")
             if not cursor:
                 break
-        reqs = [{"requestId": f"t{i}", "token": t, **thumb} for i, t in enumerate(tokens)]
-        reqs += [{"requestId": f"u{uid}", "targetId": uid, **thumb} for uid in TRACKER_IGNORE_USER_IDS]
-        players, ignored, resolved = [], set(), True
-        for i in range(0, len(reqs), 100):
-            async with s.post("https://thumbnails.roblox.com/v1/batch", json=reqs[i:i + 100]) as r:
-                if r.status != 200:
-                    raise RuntimeError(f"thumbnails answered {r.status}")
-                for item in (await r.json()).get("data", []):
-                    url = item.get("imageUrl")
-                    if item.get("requestId", "").startswith("u"):
-                        if url:
-                            ignored.add(url)
-                    elif url and item.get("state") == "Completed":
-                        players.append(url)
-                    else:
-                        resolved = False
-    return set(players) - ignored, resolved
+    return servers
+
+
+def tracker_diff(state, servers, now):
+    """Updates state in place; returns events: ("join", sid, how_many, on_server) / ("leave", sid, [seconds], left_on_server)."""
+    events = []
+    for sid, n in servers.items():
+        st = state.setdefault(sid, {"joins": [], "msg": None, "miss": 0})
+        st["miss"] = 0
+        have = len(st["joins"])
+        if n > have:
+            st["joins"] += [now] * (n - have)
+            events.append(("join", sid, n - have, n))
+        elif n < have:
+            st["joins"].sort()
+            gone, st["joins"] = st["joins"][:have - n], st["joins"][have - n:]   # assume the oldest left
+            events.append(("leave", sid, [now - t for t in gone], n))
+    for sid in [x for x in state if x not in servers]:
+        state[sid]["miss"] += 1
+        if state[sid]["miss"] >= TRACKER_MISS_LIMIT:
+            lag = (TRACKER_MISS_LIMIT - 1) * TRACKER_POLL_SECONDS
+            events.append(("leave", sid, [now - t - lag for t in state[sid]["joins"]], 0))
+    return events
 
 
 @tasks.loop(seconds=TRACKER_POLL_SECONDS)
@@ -1107,37 +1112,39 @@ async def player_tracker():
     if guild is None:
         return
     try:
-        current, resolved = await fetch_ingame_avatars()
+        servers = await fetch_game_servers()
     except Exception as e:
         print(f"! player tracker failed: {e}")
         return
-    if len(current) > TRACKER_MAX_PLAYERS:
+    total = sum(servers.values())
+    if total > TRACKER_MAX_PLAYERS:
         return
-    state = json.loads(kv_get("tracker_state") or "{}")
+    try:
+        state = json.loads(kv_get("tracker_state") or "{}")
+        if any("joins" not in v for v in state.values()):
+            state = {}
+    except (ValueError, AttributeError):
+        state = {}
     ch = await ensure_tracker_channel(guild)
     now = int(time.time())
-    for url in current:
-        if url in state:
-            state[url]["miss"] = 0
-            continue
-        embed = discord.Embed(description=f"🟢 **Gracz wszedł do OASIS** <t:{now}:t>\nW grze teraz: {len(current)}",
-                              colour=GREEN)
-        embed.set_thumbnail(url=url)
-        msg = await ch.send(content=f"<@{guild.owner_id}>", embed=embed,
-                            allowed_mentions=discord.AllowedMentions(users=True))
-        state[url] = {"start": now, "msg": msg.id, "miss": 0}
-    if resolved:
-        for url in [u for u in state if u not in current]:
-            state[url]["miss"] += 1
-            if state[url]["miss"] < TRACKER_MISS_LIMIT:
-                continue
-            info = state.pop(url)
-            played = now - info["start"] - (TRACKER_MISS_LIMIT - 1) * TRACKER_POLL_SECONDS
-            embed = discord.Embed(description=f"🔴 **Gracz wyszedł** - był w grze ok. **{fmt_played(played)}**",
-                                  colour=RED)
-            embed.set_thumbnail(url=url)
-            await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(),
-                          reference=ch.get_partial_message(info["msg"]).to_reference(fail_if_not_exists=False))
+    for kind, sid, value, on_server in tracker_diff(state, servers, now):
+        st = state[sid]
+        ref = ch.get_partial_message(st["msg"]).to_reference(fail_if_not_exists=False) if st["msg"] else None
+        if kind == "join":
+            who = "Gracz wszedł" if value == 1 else f"{value} graczy weszło"
+            embed = discord.Embed(description=f"🟢 **{who} do OASIS** <t:{now}:t>\n"
+                                              f"Na tym serwerze: {on_server} · w grze łącznie: {total}", colour=GREEN)
+            msg = await ch.send(content=f"<@{guild.owner_id}>", embed=embed, reference=ref,
+                                allowed_mentions=discord.AllowedMentions(users=True, replied_user=False))
+            st["msg"] = st["msg"] or msg.id
+        else:
+            times = ", ".join(fmt_played(t) for t in value)
+            who = "Gracz wyszedł" if len(value) == 1 else f"{len(value)} graczy wyszło"
+            embed = discord.Embed(description=f"🔴 **{who}** - czas w grze ok. **{times}**\n"
+                                              f"Na tym serwerze zostało: {on_server}", colour=RED)
+            await ch.send(embed=embed, reference=ref, allowed_mentions=discord.AllowedMentions.none())
+            if on_server == 0:
+                state.pop(sid, None)
     kv_set("tracker_state", json.dumps(state))
 
 
