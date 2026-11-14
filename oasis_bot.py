@@ -72,9 +72,9 @@ CH = {
 }
 CONTROL_CATEGORY = "🛠️ STAFF"
 
-# In-game player tracker (owner-only channel). Roblox gives only player COUNTS per server from
-# outside the game (no names, no avatars), so the tracker follows how many people are on each server.
-TRACKER_POLL_SECONDS = 60
+# In-game player tracker (owner-only channel). Roblox gives no names from outside the game, so the
+# tracker watches the game's visit counter and the live player count.
+TRACKER_POLL_SECONDS = 30
 TRACKER_MISS_LIMIT = 2                    # checks in a row a player must be missing to count as "left"
 TRACKER_MAX_PLAYERS = 30                  # above this the tracker stays quiet (it would be spam)
 CONTROL_ROLE = "Owner"
@@ -498,7 +498,7 @@ class OasisBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        for view in (VerifyView(), RolesView(), TicketPanel(), CloseTicketView(), GiveawayView()):
+        for view in (VerifyView(), RolesView(), TicketPanel(), CloseTicketView(), GiveawayView(), TrackerPanelView()):
             self.add_view(view)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
@@ -1062,10 +1062,11 @@ def fmt_played(seconds):
     return f"{h} h {m} min" if h else f"{m} min"
 
 
-async def fetch_game_servers():
-    """Public servers of the game -> {server_id: players}. Roblox gives only counts, no names."""
-    servers, cursor = {}, ""
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
+async def fetch_server_players():
+    """Players on public servers, summed -> (players, servers). Roblox gives only counts, no names."""
+    players = servers = 0
+    cursor = ""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
         for _ in range(3):
             url = (f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public?sortOrder=Asc&limit=100"
                    + (f"&cursor={cursor}" if cursor else ""))
@@ -1075,77 +1076,217 @@ async def fetch_game_servers():
                 data = await r.json()
             for server in data.get("data", []):
                 if server.get("playing", 0) > 0:
-                    servers[server["id"]] = server["playing"]
+                    players += server["playing"]
+                    servers += 1
             cursor = data.get("nextPageCursor")
             if not cursor:
                 break
-    return servers
+    return players, servers
 
 
-def tracker_diff(state, servers, now):
-    """Updates state in place; returns events: ("join", sid, how_many, on_server) / ("leave", sid, [seconds], left_on_server)."""
+def tracker_step(state, players, visits, now):
+    """Two signals: the game's visit counter (catches even very short visits) and the live player count.
+    Updates state in place; returns events ("join", how_many) / ("leave", [seconds_played])."""
     events = []
-    for sid, n in servers.items():
-        st = state.setdefault(sid, {"joins": [], "msg": None, "miss": 0})
-        st["miss"] = 0
-        have = len(st["joins"])
-        if n > have:
-            st["joins"] += [now] * (n - have)
-            events.append(("join", sid, n - have, n))
-        elif n < have:
-            st["joins"].sort()
-            gone, st["joins"] = st["joins"][:have - n], st["joins"][have - n:]   # assume the oldest left
-            events.append(("leave", sid, [now - t for t in gone], n))
-    for sid in [x for x in state if x not in servers]:
-        state[sid]["miss"] += 1
-        if state[sid]["miss"] >= TRACKER_MISS_LIMIT:
+    by_visits = 0
+    if visits is not None:
+        if state.get("visits") is not None and visits > state["visits"]:
+            by_visits = visits - state["visits"]
+        state["visits"] = visits
+    sessions = state.setdefault("sessions", [])
+    have = len(sessions)
+    by_count = max(0, players - have)
+    sessions += [now] * by_count
+    state["seen_visits"] = state.get("seen_visits", 0) + by_visits
+    state["seen_count"] = state.get("seen_count", 0) + by_count
+    total = max(state["seen_visits"], state["seen_count"])      # the same join seen twice pings once
+    new = total - state.get("pinged", 0)
+    state["pinged"] = total
+    if new > 0:
+        state["last_join"] = now
+        events.append(("join", new))
+    if players < have:
+        state["low"] = state.get("low", 0) + 1
+        if state["low"] >= TRACKER_MISS_LIMIT:                  # lower twice in a row = really left
+            sessions.sort()
+            gone = sessions[:have - players]
+            del sessions[:have - players]
             lag = (TRACKER_MISS_LIMIT - 1) * TRACKER_POLL_SECONDS
-            events.append(("leave", sid, [now - t - lag for t in state[sid]["joins"]], 0))
+            events.append(("leave", [now - t - lag for t in gone]))
+            state["low"] = 0
+    else:
+        state["low"] = 0
     return events
+
+
+TRACKER_STATS = {"started": int(time.time()), "checks": 0, "errors": 0, "last_error": "", "last_error_ts": 0,
+                 "last_ok": 0, "players": 0, "servers": 0, "visits": None, "source": ""}
+
+
+def tracker_state():
+    try:
+        state = json.loads(kv_get("tracker_state") or "{}")
+        ok = isinstance(state, dict) and all(not isinstance(v, dict) for v in state.values())
+        return state if ok else {}                       # old per-server format -> start fresh
+    except (ValueError, AttributeError):
+        return {}
+
+
+def tracker_panel_embed():
+    st, state = TRACKER_STATS, tracker_state()
+    enabled = kv_get("tracker_enabled", "1") == "1"
+    now = int(time.time())
+    if not enabled:
+        title, colour = "😴 Tracker WYŁĄCZONY", 0x95A5A6
+    elif st["last_ok"] and now - st["last_ok"] < 3 * TRACKER_POLL_SECONDS:
+        title, colour = "🟢 Tracker DZIAŁA i sprawdza grę", GREEN
+    else:
+        title, colour = "🔴 Tracker ma problem z połączeniem z Robloxem", RED
+    lines = [
+        f"**Ostatnie udane sprawdzenie:** " + (f"<t:{st['last_ok']}:R>" if st["last_ok"] else "jeszcze nie było"),
+        f"**W grze teraz:** {st['players']} (serwerów: {st['servers']})",
+        f"**Visits gry:** {st['visits'] if st['visits'] is not None else '?'}",
+        f"**Ostatnie wykryte wejście:** " + (f"<t:{state['last_join']}:R>" if state.get("last_join") else "brak"),
+        f"**Wykrytych wejść łącznie:** {state.get('pinged', 0)}",
+        f"**Sprawdzeń od startu bota:** {st['checks']} (błędów: {st['errors']}), co {TRACKER_POLL_SECONDS} s",
+    ]
+    if st["source"]:
+        lines.append(f"**Źródła danych:** {st['source']}")
+    if st["last_error"]:
+        lines.append(f"**Ostatni błąd** <t:{st['last_error_ts']}:R>: `{st['last_error'][:300]}`")
+    embed = discord.Embed(title=title, description="\n".join(lines), colour=colour)
+    embed.set_footer(text="Jeśli czas przy 'Ostatnie udane sprawdzenie' rośnie ponad minutę - bot nie działa. "
+                          f"Wersja: {kv_get('version', '?')}")
+    return embed
+
+
+class TrackerPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message("Tylko dla Ownera.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Sprawdź teraz", emoji="🔄", style=discord.ButtonStyle.primary,
+                       custom_id="oasis:tracker_check")
+    async def check_now(self, interaction: discord.Interaction, _):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        error = await tracker_check(interaction.guild, force=True)
+        st = TRACKER_STATS
+        await interaction.followup.send(
+            f"❌ Błąd: `{error}`" if error else
+            f"✅ Roblox odpowiedział. W grze: **{st['players']}**, visits: **{st['visits']}** ({st['source']})")
+
+    @discord.ui.button(label="Test pinga", emoji="🔔", style=discord.ButtonStyle.secondary,
+                       custom_id="oasis:tracker_test")
+    async def test_ping(self, interaction: discord.Interaction, _):
+        await interaction.response.send_message("Wysyłam testowy ping.", ephemeral=True)
+        await interaction.channel.send(
+            f"<@{interaction.guild.owner_id}> 🔔 To jest TEST - tak wygląda ping o wejściu gracza.",
+            allowed_mentions=discord.AllowedMentions(users=True), delete_after=60)
+
+    @discord.ui.button(label="Włącz / wyłącz", emoji="⏯️", style=discord.ButtonStyle.secondary,
+                       custom_id="oasis:tracker_toggle")
+    async def toggle(self, interaction: discord.Interaction, _):
+        on = kv_get("tracker_enabled", "1") != "1"
+        kv_set("tracker_enabled", "1" if on else "0")
+        if not on:
+            kv_set("tracker_state", json.dumps({k: v for k, v in tracker_state().items()
+                                                if k in ("panel", "pinged", "last_join")}))
+        await interaction.response.edit_message(embed=tracker_panel_embed(), view=self)
+
+
+async def update_tracker_panel(guild):
+    ch = await ensure_tracker_channel(guild)
+    panel_id = kv_get("tracker_panel")
+    if panel_id:
+        try:
+            await ch.get_partial_message(int(panel_id)).edit(embed=tracker_panel_embed(), view=TrackerPanelView())
+            return ch
+        except discord.NotFound:
+            pass
+    msg = await ch.send(embed=tracker_panel_embed(), view=TrackerPanelView())
+    kv_set("tracker_panel", msg.id)
+    try:
+        await msg.pin()
+    except discord.HTTPException:
+        pass
+    return ch
+
+
+async def tracker_check(guild, force=False):
+    """One check of the game. Returns an error text or None. Never raises."""
+    st = TRACKER_STATS
+    try:
+        if kv_get("tracker_enabled", "1") != "1" and not force:
+            await update_tracker_panel(guild)
+            return None
+        st["checks"] += 1
+        problems, sources = [], []
+        visits = playing = None
+        try:
+            game = await fetch_game()
+            visits, playing = game.get("visits"), game.get("playing", 0)
+            sources.append("licznik gry ✅")
+        except Exception as e:
+            problems.append(f"game info: {type(e).__name__}: {e}")
+            sources.append("licznik gry ❌")
+        on_servers = servers = None
+        try:
+            on_servers, servers = await fetch_server_players()
+            sources.append("lista serwerów ✅")
+        except Exception as e:
+            problems.append(f"server list: {type(e).__name__}: {e}")
+            sources.append("lista serwerów ❌")
+        st["source"] = ", ".join(sources)
+        if problems:
+            st["errors"] += 1
+            st["last_error"], st["last_error_ts"] = " | ".join(problems), int(time.time())
+        if playing is None and on_servers is None:              # nothing worked - no data this round
+            await update_tracker_panel(guild)
+            return st["last_error"]
+        players = max(playing or 0, on_servers or 0)
+        now = int(time.time())
+        st.update(last_ok=now, players=players, servers=servers or 0)
+        if visits is not None:
+            st["visits"] = visits
+        if kv_get("tracker_enabled", "1") == "1" and players <= TRACKER_MAX_PLAYERS:
+            state = tracker_state()
+            events = tracker_step(state, players, visits, now)
+            kv_set("tracker_state", json.dumps(state))
+            ch = await update_tracker_panel(guild)
+            for kind, value in events:
+                if kind == "join":
+                    who = "Nowe wejście" if value == 1 else f"{value} nowe wejścia"
+                    embed = discord.Embed(
+                        description=f"🟢 **{who} do OASIS** <t:{now}:t>\nW grze teraz: {players} · visits: "
+                                    f"{visits if visits is not None else '?'}", colour=GREEN)
+                    await ch.send(content=f"<@{guild.owner_id}>", embed=embed,
+                                  allowed_mentions=discord.AllowedMentions(users=True))
+                else:
+                    times = ", ".join(fmt_played(t) for t in value)
+                    who = "Gracz wyszedł" if len(value) == 1 else f"{len(value)} graczy wyszło"
+                    await ch.send(embed=discord.Embed(
+                        description=f"🔴 **{who}** - czas w grze ok. **{times}**\nW grze zostało: {players}",
+                        colour=RED), allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await update_tracker_panel(guild)
+        return " | ".join(problems) or None
+    except Exception as e:                                       # never let the loop die
+        st["errors"] += 1
+        st["last_error"], st["last_error_ts"] = f"{type(e).__name__}: {e}", int(time.time())
+        print(f"! player tracker failed: {st['last_error']}")
+        return st["last_error"]
 
 
 @tasks.loop(seconds=TRACKER_POLL_SECONDS)
 async def player_tracker():
-    if kv_get("tracker_enabled", "1") != "1":
-        return
     guild = bot.get_guild(GUILD_ID)
-    if guild is None:
-        return
-    try:
-        servers = await fetch_game_servers()
-    except Exception as e:
-        print(f"! player tracker failed: {e}")
-        return
-    total = sum(servers.values())
-    if total > TRACKER_MAX_PLAYERS:
-        return
-    try:
-        state = json.loads(kv_get("tracker_state") or "{}")
-        if any("joins" not in v for v in state.values()):
-            state = {}
-    except (ValueError, AttributeError):
-        state = {}
-    ch = await ensure_tracker_channel(guild)
-    now = int(time.time())
-    for kind, sid, value, on_server in tracker_diff(state, servers, now):
-        st = state[sid]
-        ref = ch.get_partial_message(st["msg"]).to_reference(fail_if_not_exists=False) if st["msg"] else None
-        if kind == "join":
-            who = "Gracz wszedł" if value == 1 else f"{value} graczy weszło"
-            embed = discord.Embed(description=f"🟢 **{who} do OASIS** <t:{now}:t>\n"
-                                              f"Na tym serwerze: {on_server} · w grze łącznie: {total}", colour=GREEN)
-            msg = await ch.send(content=f"<@{guild.owner_id}>", embed=embed, reference=ref,
-                                allowed_mentions=discord.AllowedMentions(users=True, replied_user=False))
-            st["msg"] = st["msg"] or msg.id
-        else:
-            times = ", ".join(fmt_played(t) for t in value)
-            who = "Gracz wyszedł" if len(value) == 1 else f"{len(value)} graczy wyszło"
-            embed = discord.Embed(description=f"🔴 **{who}** - czas w grze ok. **{times}**\n"
-                                              f"Na tym serwerze zostało: {on_server}", colour=RED)
-            await ch.send(embed=embed, reference=ref, allowed_mentions=discord.AllowedMentions.none())
-            if on_server == 0:
-                state.pop(sid, None)
-    kv_set("tracker_state", json.dumps(state))
+    if guild is not None:
+        await tracker_check(guild)
 
 
 @bot.tree.command(name="tracker", description="Turn the in-game player tracker on or off")
@@ -1154,10 +1295,13 @@ async def player_tracker():
 @app_commands.default_permissions(administrator=True)
 async def tracker(interaction: discord.Interaction, state: app_commands.Choice[str]):
     kv_set("tracker_enabled", state.value)
-    kv_set("tracker_state", "{}")
+    if state.value == "0":
+        kv_set("tracker_state", json.dumps({k: v for k, v in tracker_state().items()
+                                            if k in ("pinged", "last_join")}))
     await interaction.response.send_message(
         "👀 Śledzenie graczy **włączone**." if state.value == "1" else "😴 Śledzenie graczy **wyłączone**.",
         ephemeral=True)
+    await update_tracker_panel(interaction.guild)
 
 
 class AnnounceModal(discord.ui.Modal, title="New OASIS announcement"):
